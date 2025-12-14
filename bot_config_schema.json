@@ -1,0 +1,127 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Bot Model Configuration",
+  "description": "Configuration for a GigaLearnCPP bot model for transfer learning detection",
+  "type": "object",
+  "required": ["bot_name", "model_path", "architecture", "observation", "action_parser"],
+  "properties": {
+    "bot_name": {
+      "type": "string",
+      "description": "Name/identifier of the bot"
+    },
+    "model_path": {
+      "type": "string",
+      "description": "Path to directory containing SHARED_HEAD.lt and POLICY.lt"
+    },
+    "architecture": {
+      "type": "object",
+      "required": ["shared_head_layers", "policy_layers"],
+      "properties": {
+        "shared_head_layers": {
+          "type": "array",
+          "items": {"type": "integer"},
+          "description": "Layer sizes for shared head, e.g. [512, 512, 512, 512]"
+        },
+        "policy_layers": {
+          "type": "array",
+          "items": {"type": "integer"},
+          "description": "Layer sizes for policy head, e.g. [1024, 512, 512, 512, 512]"
+        },
+        "activation": {
+          "type": "string",
+          "enum": ["relu", "leaky_relu", "tanh", "sigmoid"],
+          "default": "relu",
+          "description": "Activation function used"
+        },
+        "layer_norm": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether layer normalization is used"
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "required": ["obs_size", "obs_builder_path"],
+      "properties": {
+        "obs_size": {
+          "type": "integer",
+          "description": "Size of observation vector (e.g. 109 for AdvancedObs)"
+        },
+        "obs_builder_path": {
+          "type": "string",
+          "description": "Path to Python file containing observation builder class"
+        },
+        "obs_builder_class": {
+          "type": "string",
+          "default": "AdvancedObs",
+          "description": "Name of the observation builder class"
+        }
+      }
+    },
+    "action_parser": {
+      "type": "object",
+      "required": ["action_size", "action_parser_path"],
+      "properties": {
+        "action_size": {
+          "type": "integer",
+          "description": "Number of discrete actions (e.g. 90 for standard LookupAction)"
+        },
+        "action_parser_path": {
+          "type": "string",
+          "description": "Path to Python file containing action parser class"
+        },
+        "action_parser_class": {
+          "type": "string",
+          "default": "LookupAction",
+          "description": "Name of the action parser class"
+        },
+        "action_bins": {
+          "type": "array",
+          "description": "Bins used for LookupAction (optional)",
+          "default": [[-1, 0, 1], [-1, 0, 1], [-1, 0, 1], [-1, 0, 1], [-1, 0, 1]]
+        }
+      }
+    },
+    "discrete_policy": {
+      "type": "object",
+      "properties": {
+        "discrete_policy_path": {
+          "type": "string",
+          "description": "Path to discrete policy implementation (e.g. discrete_policy.py)"
+        },
+        "discrete_policy_class": {
+          "type": "string",
+          "default": "DiscreteFF",
+          "description": "Name of the discrete policy class"
+        }
+      }
+    },
+    "additional_paths": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Additional Python paths to add to sys.path for imports"
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "tournament": {
+          "type": "string",
+          "description": "Tournament this bot was used in"
+        },
+        "author": {
+          "type": "string",
+          "description": "Bot author (if known)"
+        },
+        "training_steps": {
+          "type": "integer",
+          "description": "Number of training steps (if known)"
+        },
+        "notes": {
+          "type": "string",
+          "description": "Additional notes about the bot"
+        }
+      }
+    }
+  }
+}
