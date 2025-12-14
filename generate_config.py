@@ -137,15 +137,20 @@ class BotConfigGenerator:
             print(f"    - Obs Builder Class: {class_name}")
     
     def analyze_action_parser(self):
-        """Analyze action parser file"""
+        """
+        Analyze action parser file.
+        
+        updates: now uses black magic (dynamic imports) to try and actually run the code
+        because you people keep writing procedural action generators that regex can't read.
+        """
         # Try common names
-        for name in ["your_act.py", "action_parser.py", "actions.py"]:
+        for name in ["your_act.py", "action_parser.py", "actions.py", "discrete_act.py"]:
             action_file = self.find_file(name)
             if action_file:
                 break
         
         if not action_file:
-            print("  ⚠️  Action parser file not found")
+            print("  ⚠️  Action parser file not found. good luck.")
             return
         
         print(f"  ✓ Found action parser: {action_file}")
@@ -154,14 +159,63 @@ class BotConfigGenerator:
         with open(action_file, 'r') as f:
             content = f.read()
         
-        # Find action parser class
+        # Find action parser class name so we know what to instantiate later
+        class_name = "LookupAction" # default fallback
         class_match = re.search(r'class\s+(\w+).*:', content)
         if class_match:
             class_name = class_match.group(1)
             self.config['action_parser']['action_parser_class'] = class_name
             print(f"    - Action Parser Class: {class_name}")
+
+        # --- THE "I GIVE UP" SECTION ---
+        # attempt to dynamically import the file and run it. 
+        # yes, this is security nightmare. no, i don't care anymore.
+        try:
+            import importlib.util
+            
+            # tell python to pretend this random file is a module
+            spec = importlib.util.spec_from_file_location("dynamic_action_parser", action_file)
+            module = importlib.util.module_from_spec(spec)
+            
+            # hack to make relative imports inside the bot work (maybe)
+            sys.modules["dynamic_action_parser"] = module 
+            
+            # execute the module. if this crashes because you don't have numpy installed, 
+            # that is between you and god.
+            spec.loader.exec_module(module)
+            
+            if hasattr(module, class_name):
+                cls = getattr(module, class_name)
+                
+                # attempt to instantiate. pray it takes no arguments in __init__
+                # if your init requires arguments, i am so sorry but you are on your own.
+                print(f"    ... attempting to instantiate {class_name} to check size ...")
+                instance = cls()
+                
+                size = 0
+                # check for standard methods/attributes
+                if hasattr(instance, 'get_action_space_size'):
+                    size = instance.get_action_space_size()
+                elif hasattr(instance, '_lookup_table'):
+                    # support for that specific weird C++ port logic you pasted
+                    size = len(instance._lookup_table)
+                elif hasattr(instance, 'actions'):
+                    size = len(instance.actions)
+                
+                if size > 0:
+                    self.config['action_parser']['action_size'] = int(size)
+                    print(f"    ✓ calculated action size via execution: {size}")
+                    return # we are done here, thank the lord
+                    
+        except ImportError as e:
+            print(f"    ⚠️  Failed to import action parser (missing libs?): {e}")
+        except Exception as e:
+            print(f"    ⚠️  Dynamic analysis failed (it was a long shot anyway): {e}")
+
+        # --- FALLBACK TO REGEX GUESSING ---
+        # if we reach here, the dynamic import failed. back to guessing.
         
-        # Try to count actions in lookup table
+        # Try to count actions in lookup table via bins definition
         if 'make_lookup_table' in content or '_lookup_table' in content:
             # Try to estimate action size from bins
             bins_match = re.search(r'bins\s*=\s*\[([^\]]+)\]', content)
@@ -172,6 +226,8 @@ class BotConfigGenerator:
                     print(f"    - Estimated action size: 90 (standard LookupAction)")
                 except:
                     pass
+            else:
+                 print("    ⚠️  Could not determine action size. Please fill 'action_size' manually in json.")
     
     def analyze_discrete_policy(self):
         """Analyze discrete policy file"""
