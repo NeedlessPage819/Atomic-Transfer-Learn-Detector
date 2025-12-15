@@ -1,17 +1,3 @@
-"""
-Atomic Terminal // Transfer Learning Detector (NO-FUN ALLOWED EDITION)
-v2.2 (stripped of all joy and unicode)
-
-this script compares two rocket league bots to see if one is a cheap knockoff.
-it performs the full suite of audit tests.
-
-usage:
-    python tl_detector.py original.json sus.json
-    python tl_detector.py --config original.json sus.json --output results.json
-
-if this crashes, check your python paths. if it still crashes, pray.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,6 +13,574 @@ from pathlib import Path
 from scipy.stats import spearmanr, pearsonr
 from scipy.spatial.distance import cosine
 import warnings
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from scipy.stats import spearmanr, pearsonr, ks_2samp
+from scipy.spatial.distance import cosine, euclidean
+from scipy.linalg import svd
+import warnings
+warnings.filterwarnings('ignore')
+
+
+def generate_kickoff_states(num_states=100):
+    """
+    Generate realistic kickoff observation states based on GigaLearnCPP/RLGymCPP
+    
+    AdvancedObs structure (109 elements for 1v1):
+    - Ball: pos(3) + vel(3) + angVel(3) = 9
+    - PrevAction: 8 elements
+    - BoostPads: 34 elements (timers)
+    - Self: pos(3) + forward(3) + up(3) + vel(3) + angVel(3) + localAngVel(3) + 
+            localBallPos(3) + localBallVel(3) + boost(1) + onGround(1) + hasFlip(1) + isDemoed(1) + hasJumped(1) = 29
+    - Opponent: same 29 elements
+    Total: 9 + 8 + 34 + 29 + 29 = 109
+    """
+    states = []
+    
+    # Kickoff positions (5 positions per team in standard Rocket League)
+    kickoff_positions = [
+        # Diagonal left
+        np.array([-2048, -2560, 17], dtype=np.float32),
+        # Diagonal right
+        np.array([2048, -2560, 17], dtype=np.float32),
+        # Back left
+        np.array([-256, -3840, 17], dtype=np.float32),
+        # Back right
+        np.array([256, -3840, 17], dtype=np.float32),
+        # Center
+        np.array([0, -4608, 17], dtype=np.float32)
+    ]
+    
+    for _ in range(num_states):
+        obs = np.zeros(109, dtype=np.float32)
+        
+        # Ball at center (normalized)
+        obs[0:3] = [0, 0, 93/5000]  # Center of field, on ground
+        obs[3:6] = [0, 0, 0]  # No velocity at kickoff
+        obs[6:9] = [0, 0, 0]  # No angular velocity
+        
+        # Previous action (zeros at kickoff)
+        obs[9:17] = [0] * 8
+        
+        # Boost pads (all available at kickoff)
+        obs[17:51] = [1.0] * 34
+        
+        # Self player - random kickoff position (blue team)
+        pos_idx = np.random.randint(0, len(kickoff_positions))
+        pos = kickoff_positions[pos_idx].copy()
+        # Add small noise
+        pos += np.random.randn(3) * 50
+        
+        # Normalize position
+        obs[51:54] = pos / 5000
+        
+        # Forward vector (facing ball)
+        forward = np.array([0, 1, 0]) + np.random.randn(3) * 0.05
+        forward = forward / (np.linalg.norm(forward) + 1e-8)
+        obs[54:57] = forward
+        
+        # Up vector
+        obs[57:60] = [0, 0, 1]
+        
+        # Velocity (small at kickoff)
+        obs[60:63] = np.random.randn(3) * 0.01
+        
+        # Angular velocity (small)
+        obs[63:66] = np.random.randn(3) * 0.01
+        obs[66:69] = np.random.randn(3) * 0.01  # Local angular velocity
+        
+        # Local ball position
+        local_ball = np.array([0, 0, 93]) - pos
+        obs[69:72] = local_ball / 5000
+        
+        # Local ball velocity
+        obs[72:75] = [0, 0, 0]
+        
+        # Boost amount (usually 33 at kickoff)
+        obs[75] = 0.33 + np.random.rand() * 0.01
+        
+        # On ground
+        obs[76] = 1.0
+        
+        # Has flip
+        obs[77] = 1.0
+        
+        # Is demoed
+        obs[78] = 0.0
+        
+        # Has jumped
+        obs[79] = 0.0
+        
+        # Opponent (orange team) - opposite side
+        opp_pos = -pos.copy()
+        opp_pos += np.random.randn(3) * 50
+        obs[80:83] = opp_pos / 5000
+        
+        # Opponent forward (facing ball)
+        opp_forward = np.array([0, -1, 0]) + np.random.randn(3) * 0.05
+        opp_forward = opp_forward / (np.linalg.norm(opp_forward) + 1e-8)
+        obs[83:86] = opp_forward
+        
+        # Opponent up
+        obs[86:89] = [0, 0, 1]
+        
+        # Opponent velocities (small)
+        obs[89:92] = np.random.randn(3) * 0.01
+        obs[92:95] = np.random.randn(3) * 0.01
+        obs[95:98] = np.random.randn(3) * 0.01
+        
+        # Opponent local ball
+        opp_local_ball = np.array([0, 0, 93]) - opp_pos
+        obs[98:101] = opp_local_ball / 5000
+        obs[101:104] = [0, 0, 0]
+        
+        # Opponent boost
+        obs[104] = 0.33 + np.random.rand() * 0.01
+        obs[105] = 1.0  # On ground
+        obs[106] = 1.0  # Has flip
+        obs[107] = 0.0  # Not demoed
+        obs[108] = 0.0  # Hasn't jumped
+        
+        states.append(obs)
+    
+    return np.array(states, dtype=np.float32)
+
+
+def generate_realistic_game_states(num_states=100):
+    """Generate realistic mid-game states"""
+    states = []
+    
+    for _ in range(num_states):
+        obs = np.zeros(109, dtype=np.float32)
+        
+        # Ball in random position
+        obs[0] = np.random.uniform(-4096, 4096) / 5000  # X
+        obs[1] = np.random.uniform(-5120, 5120) / 5000  # Y
+        obs[2] = np.random.uniform(93, 2000) / 5000     # Z
+        
+        # Ball velocity
+        obs[3:6] = np.random.randn(3) * 0.5
+        
+        # Ball angular velocity
+        obs[6:9] = np.random.randn(3) * 0.3
+        
+        # Previous action (random)
+        obs[9:17] = np.random.uniform(-1, 1, 8)
+        
+        # Boost pads (random availability)
+        obs[17:51] = np.random.rand(34)
+        
+        # Self player
+        obs[51:54] = np.random.uniform(-1, 1, 3)  # Position
+        forward = np.random.randn(3)
+        forward = forward / (np.linalg.norm(forward) + 1e-8)
+        obs[54:57] = forward
+        up = np.random.randn(3)
+        up = up / (np.linalg.norm(up) + 1e-8)
+        obs[57:60] = up
+        obs[60:63] = np.random.randn(3) * 0.5  # Velocity
+        obs[63:69] = np.random.randn(6) * 0.3  # Angular velocities
+        obs[69:75] = np.random.randn(6) * 0.5  # Local ball pos/vel
+        obs[75] = np.random.rand()  # Boost
+        obs[76] = np.random.choice([0, 1])  # On ground
+        obs[77] = np.random.choice([0, 1])  # Has flip
+        obs[78] = 0.0  # Is demoed
+        obs[79] = np.random.choice([0, 1])  # Has jumped
+        
+        # Opponent (similar)
+        obs[80:109] = obs[51:80].copy()
+        obs[80:83] += np.random.randn(3) * 0.2  # Different position
+        
+        states.append(obs)
+    
+    return np.array(states, dtype=np.float32)
+
+
+class AdvancedDetectionMethods:
+    """Additional detection methods for the main detector"""
+    
+    @staticmethod
+    def analyze_layer_features(model1_dict, model2_dict, device, num_samples=500):
+        """
+        Extract and compare features learned by each layer
+        Returns correlation of feature representations
+        """
+        results = {'method': 'layer_features'}
+        
+        # Generate test inputs
+        test_inputs = torch.randn(num_samples, 109).to(device)
+        
+        layer_correlations = []
+        
+        with torch.no_grad():
+            # Get all intermediate activations
+            acts1 = []
+            acts2 = []
+            
+            # Model 1
+            x1 = test_inputs
+            if 'shared_head' in model1_dict:
+                for layer in model1_dict['shared_head']:
+                    if isinstance(layer, nn.Linear):
+                        x1 = layer(x1)
+                        acts1.append(x1.clone())
+                    elif isinstance(layer, nn.ReLU):
+                        x1 = layer(x1)
+            
+            # Model 2
+            x2 = test_inputs
+            if 'shared_head' in model2_dict:
+                for layer in model2_dict['shared_head']:
+                    if isinstance(layer, nn.Linear):
+                        x2 = layer(x2)
+                        acts2.append(x2.clone())
+                    elif isinstance(layer, nn.ReLU):
+                        x2 = layer(x2)
+            
+            # Compare layer-wise
+            for i, (a1, a2) in enumerate(zip(acts1, acts2)):
+                # Compute correlation of feature activations
+                a1_flat = a1.flatten().cpu().numpy()
+                a2_flat = a2.flatten().cpu().numpy()
+                
+                min_len = min(len(a1_flat), len(a2_flat))
+                if min_len > 10:
+                    corr, _ = spearmanr(a1_flat[:min_len], a2_flat[:min_len])
+                    if not np.isnan(corr):
+                        layer_correlations.append({
+                            'layer': i,
+                            'correlation': float(corr)
+                        })
+        
+        results['layer_correlations'] = layer_correlations
+        results['avg_layer_correlation'] = float(np.mean([l['correlation'] for l in layer_correlations])) if layer_correlations else 0
+        
+        return results
+    
+    @staticmethod
+    def analyze_decision_boundaries(model1_dict, model2_dict, device, obs_size, num_samples=200):
+        """
+        Compare decision boundaries by testing around decision points
+        """
+        results = {'method': 'decision_boundaries'}
+        
+        # Generate base states
+        base_states = torch.randn(num_samples, obs_size).to(device)
+        
+        boundary_agreements = []
+        
+        with torch.no_grad():
+            # Get predictions
+            def get_pred(model_dict, x):
+                if 'shared_head' in model_dict:
+                    x = model_dict['shared_head'](x)
+                if 'policy' in model_dict:
+                    x = model_dict['policy'](x)
+                return torch.argmax(x, dim=-1)
+            
+            pred1 = get_pred(model1_dict, base_states)
+            pred2 = get_pred(model2_dict, base_states)
+            
+            # Test perturbations around each state
+            for i in range(min(50, num_samples)):
+                base = base_states[i:i+1]
+                
+                # Generate perturbations
+                perturbations = []
+                for _ in range(10):
+                    noise = torch.randn_like(base) * 0.1
+                    perturbations.append(base + noise)
+                
+                perturbations = torch.cat(perturbations, dim=0)
+                
+                # Get predictions on perturbations
+                perturbed_pred1 = get_pred(model1_dict, perturbations)
+                perturbed_pred2 = get_pred(model2_dict, perturbations)
+                
+                # Check if decision boundaries are similar
+                agreement = (perturbed_pred1 == perturbed_pred2).float().mean().item()
+                boundary_agreements.append(agreement)
+        
+        results['boundary_agreement'] = float(np.mean(boundary_agreements)) if boundary_agreements else 0
+        results['boundary_std'] = float(np.std(boundary_agreements)) if boundary_agreements else 0
+        
+        return results
+    
+    @staticmethod
+    def analyze_neuron_activation_patterns(model1_dict, model2_dict, device, num_samples=500):
+        """
+        Analyze which neurons activate together (co-activation patterns)
+        """
+        results = {'method': 'neuron_coactivation'}
+        
+        test_inputs = torch.randn(num_samples, 109).to(device)
+        
+        def get_activations(model_dict, x):
+            activations = []
+            if 'shared_head' in model_dict:
+                for layer in model_dict['shared_head']:
+                    x = layer(x)
+                    if isinstance(layer, nn.ReLU):
+                        # Record binary activation (neuron on/off)
+                        activations.append((x > 0).float())
+            return activations
+        
+        with torch.no_grad():
+            acts1 = get_activations(model1_dict, test_inputs)
+            acts2 = get_activations(model2_dict, test_inputs)
+            
+            pattern_similarities = []
+            
+            for a1, a2 in zip(acts1, acts2):
+                # Compute co-activation matrix
+                # (which pairs of neurons activate together)
+                coact1 = (a1.T @ a1) / num_samples  # Correlation matrix
+                coact2 = (a2.T @ a2) / num_samples
+                
+                # Flatten and compare
+                c1_flat = coact1.flatten().cpu().numpy()
+                c2_flat = coact2.flatten().cpu().numpy()
+                
+                min_len = min(len(c1_flat), len(c2_flat))
+                if min_len > 100:
+                    corr, _ = spearmanr(c1_flat[:min_len], c2_flat[:min_len])
+                    if not np.isnan(corr):
+                        pattern_similarities.append(float(corr))
+        
+        results['coactivation_similarity'] = float(np.mean(pattern_similarities)) if pattern_similarities else 0
+        
+        return results
+    
+    @staticmethod
+    def analyze_temporal_consistency(model1_dict, model2_dict, device, obs_builder1=None, obs_builder2=None):
+        """
+        Test how decisions evolve over a sequence of game states
+        """
+        results = {'method': 'temporal_consistency'}
+        
+        # Generate a sequence of states (simulating a game progression)
+        num_sequences = 20
+        sequence_length = 10
+        
+        sequence_agreements = []
+        
+        with torch.no_grad():
+            for _ in range(num_sequences):
+                # Start with kickoff
+                kickoff = generate_kickoff_states(1)[0]
+                
+                # Evolve state
+                sequence = [kickoff]
+                for _ in range(sequence_length - 1):
+                    # Apply random "physics" progression
+                    next_state = sequence[-1].copy()
+                    # Update ball position
+                    next_state[0:3] += next_state[3:6] * 0.1  # pos += vel * dt
+                    # Add noise
+                    next_state += np.random.randn(109) * 0.05
+                    # Clip to valid ranges
+                    next_state = np.clip(next_state, -2, 2)
+                    sequence.append(next_state)
+                
+                sequence = torch.from_numpy(np.array(sequence)).float().to(device)
+                
+                # Get action sequences from both models
+                def get_action_sequence(model_dict, states):
+                    actions = []
+                    for state in states:
+                        x = state.unsqueeze(0)
+                        if 'shared_head' in model_dict:
+                            x = model_dict['shared_head'](x)
+                        if 'policy' in model_dict:
+                            x = model_dict['policy'](x)
+                        action = torch.argmax(x, dim=-1).item()
+                        actions.append(action)
+                    return actions
+                
+                seq1 = get_action_sequence(model1_dict, sequence)
+                seq2 = get_action_sequence(model2_dict, sequence)
+                
+                # Compare sequences
+                agreement = sum(a1 == a2 for a1, a2 in zip(seq1, seq2)) / sequence_length
+                sequence_agreements.append(agreement)
+        
+        results['temporal_agreement'] = float(np.mean(sequence_agreements)) if sequence_agreements else 0
+        results['temporal_std'] = float(np.std(sequence_agreements)) if sequence_agreements else 0
+        
+        return results
+    
+    @staticmethod
+    def analyze_kickoff_behavior(model1_dict, model2_dict, device, num_kickoffs=100):
+        """
+        Specifically analyze behavior on kickoff states
+        This is realistic and important for RL bots
+        """
+        results = {'method': 'kickoff_analysis'}
+        
+        # Generate kickoff states
+        kickoff_states = generate_kickoff_states(num_kickoffs)
+        kickoff_tensor = torch.from_numpy(kickoff_states).to(device)
+        
+        with torch.no_grad():
+            # Get predictions
+            def get_probs(model_dict, x):
+                if 'shared_head' in model_dict:
+                    x = model_dict['shared_head'](x)
+                if 'policy' in model_dict:
+                    x = model_dict['policy'](x)
+                return F.softmax(x, dim=-1)
+            
+            probs1 = get_probs(model1_dict, kickoff_tensor)
+            probs2 = get_probs(model2_dict, kickoff_tensor)
+            
+            # Compare action distributions on kickoffs
+            actions1 = torch.argmax(probs1, dim=-1).cpu().numpy()
+            actions2 = torch.argmax(probs2, dim=-1).cpu().numpy()
+            
+            # Action agreement
+            agreement = np.mean(actions1 == actions2)
+            
+            # KL divergence on probability distributions
+            kl_divs = []
+            for p1, p2 in zip(probs1, probs2):
+                min_actions = min(len(p1), len(p2))
+                p1_trim = p1[:min_actions]
+                p2_trim = p2[:min_actions]
+                kl = F.kl_div(p2_trim.log(), p1_trim, reduction='sum').item()
+                kl_divs.append(kl)
+            
+            avg_kl = np.mean(kl_divs)
+            
+            # Analyze action diversity
+            unique_actions1 = len(np.unique(actions1))
+            unique_actions2 = len(np.unique(actions2))
+            
+        results['kickoff_action_agreement'] = float(agreement)
+        results['kickoff_avg_kl_divergence'] = float(avg_kl)
+        results['kickoff_action_diversity_model1'] = int(unique_actions1)
+        results['kickoff_action_diversity_model2'] = int(unique_actions2)
+        
+        return results
+    
+    @staticmethod
+    def analyze_robustness(model1_dict, model2_dict, device, obs_size, num_samples=100):
+        """
+        Test adversarial robustness - similar robustness suggests similar decision boundaries
+        """
+        results = {'method': 'robustness_testing'}
+        
+        base_states = torch.randn(num_samples, obs_size).to(device)
+        
+        robustness_correlations = []
+        
+        with torch.no_grad():
+            def get_confidence(model_dict, x):
+                if 'shared_head' in model_dict:
+                    x = model_dict['shared_head'](x)
+                if 'policy' in model_dict:
+                    x = model_dict['policy'](x)
+                probs = F.softmax(x, dim=-1)
+                return torch.max(probs, dim=-1)[0]
+            
+            # Test with increasing noise levels
+            noise_levels = [0.01, 0.05, 0.1, 0.2, 0.5]
+            
+            for noise_std in noise_levels:
+                noise = torch.randn_like(base_states) * noise_std
+                noisy_states = base_states + noise
+                
+                # Get confidence on noisy inputs
+                conf1 = get_confidence(model1_dict, noisy_states).cpu().numpy()
+                conf2 = get_confidence(model2_dict, noisy_states).cpu().numpy()
+                
+                # Correlate robustness
+                corr, _ = spearmanr(conf1, conf2)
+                if not np.isnan(corr):
+                    robustness_correlations.append({
+                        'noise_level': noise_std,
+                        'confidence_correlation': float(corr)
+                    })
+        
+        results['robustness_correlations'] = robustness_correlations
+        results['avg_robustness_correlation'] = float(np.mean([r['confidence_correlation'] for r in robustness_correlations])) if robustness_correlations else 0
+        
+        return results
+    
+    @staticmethod
+    def detect_transfer_learning_signature(model1_dict, model2_dict):
+        """
+        Look for specific signatures of transfer learning:
+        - Early layers very similar, later layers different
+        - Similar low-level features, different high-level features
+        """
+        results = {'method': 'transfer_learning_signature'}
+        
+        def get_layer_weights(model_dict):
+            weights = []
+            for key in ['shared_head', 'policy']:
+                if key in model_dict:
+                    for name, param in model_dict[key].named_parameters():
+                        if 'weight' in name:
+                            weights.append(param.detach().cpu().numpy())
+            return weights
+        
+        weights1 = get_layer_weights(model1_dict)
+        weights2 = get_layer_weights(model2_dict)
+        
+        if len(weights1) != len(weights2):
+            results['signature_detected'] = False
+            results['reason'] = 'different_architectures'
+            return results
+        
+        # Compute similarity for each layer
+        layer_similarities = []
+        for w1, w2 in zip(weights1, weights2):
+            if w1.shape == w2.shape:
+                # Flatten and compare
+                w1_flat = w1.flatten()
+                w2_flat = w2.flatten()
+                sim = 1 - cosine(w1_flat, w2_flat)
+                layer_similarities.append(sim)
+            else:
+                layer_similarities.append(0)
+        
+        results['layer_similarities'] = [float(s) for s in layer_similarities]
+        
+        # Check for transfer learning pattern
+        if len(layer_similarities) >= 3:
+            early_avg = np.mean(layer_similarities[:len(layer_similarities)//2])
+            late_avg = np.mean(layer_similarities[len(layer_similarities)//2:])
+            
+            # Transfer learning signature: early layers similar, later different
+            if early_avg > 0.8 and late_avg < 0.6:
+                results['signature_detected'] = True
+                results['pattern'] = 'early_frozen_late_trained'
+                results['early_similarity'] = float(early_avg)
+                results['late_similarity'] = float(late_avg)
+            elif early_avg > 0.9 and late_avg > 0.9:
+                results['signature_detected'] = True
+                results['pattern'] = 'full_model_copy'
+                results['early_similarity'] = float(early_avg)
+                results['late_similarity'] = float(late_avg)
+            else:
+                results['signature_detected'] = False
+                results['early_similarity'] = float(early_avg)
+                results['late_similarity'] = float(late_avg)
+        else:
+            results['signature_detected'] = False
+            results['reason'] = 'insufficient_layers'
+        
+        return results
+
+
+# Export for use in main detector
+__all__ = [
+    'AdvancedDetectionMethods',
+    'generate_kickoff_states',
+    'generate_realistic_game_states'
+]
 
 # silence is golden. warnings are annoying.
 warnings.filterwarnings('ignore')
@@ -111,7 +665,7 @@ class Atomic:
 
     @staticmethod
     def section(title, index=None):
-        idx_str = f"[{index}/7] " if index else ""
+        idx_str = f"[{index}/11] " if index else ""
         # simple ascii separator
         print(f"\n{Atomic.PURPLE}>>> {idx_str}{title} {Atomic.GREY}{'-'*(50-len(title)-len(idx_str))}{Atomic.RESET}")
 
@@ -997,7 +1551,7 @@ class TransferLearningDetector:
         Compute final verdict.
         updated logic: if the fingerprints match, i don't care if the shoes don't fit.
         """
-        Atomic.section("FINAL JUDGMENT", 7)
+        Atomic.section("FINAL JUDGMENT", 11)
         
         score = 0
         max_score = 0
@@ -1063,6 +1617,57 @@ class TransferLearningDetector:
                 if 'HIGH' in verdict: score += 2
                 elif 'MED' in verdict: score += 1
         
+        # ==================== NEW ADVANCED METHODS SCORING ====================
+        # 6. Kickoff Analysis (4 points)
+        if 'kickoff_analysis' in self.results and 'verdict' in self.results['kickoff_analysis']:
+            max_score += 4
+            verdict = self.results['kickoff_analysis']['verdict']
+            if 'CRIT' in verdict: 
+                score += 4
+                evidence.append(f"Kickoff Behavior: {verdict}")
+            elif 'WARN' in verdict: 
+                score += 2
+                evidence.append(f"Kickoff Behavior: {verdict}")
+        
+        # 7. Transfer Learning Signature (5 points - CRITICAL)
+        if 'transfer_signature' in self.results and 'verdict' in self.results.get('transfer_signature', {}):
+            max_score += 5
+            verdict = self.results['transfer_signature'].get('verdict', '')
+            if 'CRIT' in verdict:
+                score += 5
+                evidence.append(f"TL Signature: {verdict}")
+        
+        # 8. Eigenvalue Spectrum (3 points)
+        if 'eigenvalue_spectrum' in self.results and 'verdict' in self.results['eigenvalue_spectrum']:
+            max_score += 3
+            verdict = self.results['eigenvalue_spectrum']['verdict']
+            if 'CRIT' in verdict:
+                score += 3
+                evidence.append(f"Eigenvalue Spectrum: {verdict}")
+            elif 'WARN' in verdict:
+                score += 2
+        
+        # 9. Decision Boundaries (3 points)
+        if 'decision_boundaries' in self.results and 'verdict' in self.results['decision_boundaries']:
+            max_score += 3
+            verdict = self.results['decision_boundaries']['verdict']
+            if 'CRIT' in verdict:
+                score += 3
+                evidence.append(f"Decision Boundaries: {verdict}")
+            elif 'WARN' in verdict:
+                score += 2
+        
+        # 10. Temporal Consistency (2 points)
+        if 'temporal_consistency' in self.results and 'verdict' in self.results['temporal_consistency']:
+            max_score += 2
+            verdict = self.results['temporal_consistency']['verdict']
+            if 'CRIT' in verdict:
+                score += 2
+                evidence.append(f"Temporal Behavior: {verdict}")
+            elif 'WARN' in verdict:
+                score += 1
+        # ==================== END NEW METHODS SCORING ====================
+        
         # --- PHASE 3: CALCULATE CONFIDENCE ---
         
         if smoking_gun:
@@ -1111,6 +1716,431 @@ class TransferLearningDetector:
         
         return self.results['final_verdict']
     
+
+    # ==================== ADVANCED DETECTION METHODS ====================
+    # Added by integrate_advanced_methods.py
+    
+    def analyze_kickoff_behavior(self, num_kickoffs: int = 100) -> Dict:
+        """
+        [NEW METHOD 1/8] Analyze behavior specifically on kickoff states
+        Uses realistic Rocket League kickoff positions from GigaLearnCPP
+        """
+        Atomic.section("KICKOFF BEHAVIOR ANALYSIS", 7)
+
+
+        # Generate kickoff states (base 109 dimensions)
+        kickoff_states = generate_kickoff_states(num_kickoffs)
+
+        with torch.no_grad():
+            # Prepare inputs for each model
+            base_obs_size = 109
+            kickoff_tensor1 = torch.from_numpy(kickoff_states).to(self.device)
+            kickoff_tensor2 = torch.from_numpy(kickoff_states).to(self.device)
+
+            # Pad/crop to match each model's expected input
+            if self.original_cfg.obs_size > base_obs_size:
+                kickoff_tensor1 = F.pad(kickoff_tensor1, (0, self.original_cfg.obs_size - base_obs_size))
+            elif self.original_cfg.obs_size < base_obs_size:
+                kickoff_tensor1 = kickoff_tensor1[:, :self.original_cfg.obs_size]
+
+            if self.suspicious_cfg.obs_size > base_obs_size:
+                kickoff_tensor2 = F.pad(kickoff_tensor2, (0, self.suspicious_cfg.obs_size - base_obs_size))
+            elif self.suspicious_cfg.obs_size < base_obs_size:
+                kickoff_tensor2 = kickoff_tensor2[:, :self.suspicious_cfg.obs_size]
+
+            # Get predictions
+            def get_probs(model_dict, x):
+                if 'shared_head' in model_dict:
+                    x = model_dict['shared_head'](x)
+                if 'policy' in model_dict:
+                    x = model_dict['policy'](x)
+                return F.softmax(x, dim=-1)
+
+            probs1 = get_probs(self.original_model, kickoff_tensor1)
+            probs2 = get_probs(self.suspicious_model, kickoff_tensor2)
+            
+            # Compare action distributions on kickoffs
+            actions1 = torch.argmax(probs1, dim=-1).cpu().numpy()
+            actions2 = torch.argmax(probs2, dim=-1).cpu().numpy()
+            
+            # Action agreement
+            agreement = np.mean(actions1 == actions2)
+            
+            # KL divergence on probability distributions
+            kl_divs = []
+            for p1, p2 in zip(probs1, probs2):
+                min_actions = min(len(p1), len(p2))
+                p1_trim = p1[:min_actions]
+                p2_trim = p2[:min_actions]
+                kl = F.kl_div(p2_trim.log(), p1_trim, reduction='sum').item()
+                kl_divs.append(kl)
+            
+            avg_kl = np.mean(kl_divs)
+            
+            # Analyze action diversity
+            unique_actions1 = len(np.unique(actions1))
+            unique_actions2 = len(np.unique(actions2))
+        
+        self.results['kickoff_analysis'] = {
+            'action_agreement': float(agreement),
+            'avg_kl_divergence': float(avg_kl),
+            'action_diversity_model1': int(unique_actions1),
+            'action_diversity_model2': int(unique_actions2),
+            'num_kickoffs_tested': num_kickoffs
+        }
+        
+        if agreement > 0.8:
+            verdict = "[CRIT] IDENTICAL KICKOFF BEHAVIOR"
+            c = Atomic.RED
+        elif agreement > 0.6:
+            verdict = "[WARN] SIMILAR KICKOFF DECISIONS"
+            c = Atomic.YELLOW
+        else:
+            verdict = "[SAFE] DIFFERENT KICKOFF STRATEGIES"
+            c = Atomic.GREEN
+        
+        Atomic.kv("Action Agreement", f"{agreement:.4f}", c)
+        Atomic.kv("KL Divergence", f"{avg_kl:.4f}", Atomic.WHITE)
+        Atomic.kv("Verdict", verdict, c)
+        
+        self.results['kickoff_analysis']['verdict'] = verdict
+        return self.results['kickoff_analysis']
+    
+    def analyze_eigenvalue_spectrum(self) -> Dict:
+        """
+        [NEW METHOD 2/8] Compare eigenvalue spectra using Entropy and Effective Rank.
+        Old method (Correlation) was flawed because all nets look the same.
+        This method checks 'Information Density' and 'Complexity' instead.
+        """
+        Atomic.section("EIGENVALUE SPECTRUM (ENTROPY)", 8)
+        
+        from scipy.linalg import svd
+        
+        def get_weight_matrices(model_dict):
+            matrices = []
+            for key in ['shared_head', 'policy']:
+                if key in model_dict:
+                    for name, param in model_dict[key].named_parameters():
+                        # Only grab 2D weights (Linear layers), skip biases/norms
+                        if 'weight' in name and param.ndim == 2:
+                            matrices.append(param.detach().cpu().numpy())
+            return matrices
+        
+        matrices1 = get_weight_matrices(self.original_model)
+        matrices2 = get_weight_matrices(self.suspicious_model)
+        
+        # If architecture is totally different, we can't compare layer-by-layer
+        if len(matrices1) != len(matrices2):
+            Atomic.log("Architecture mismatch - skipping spectral comparison", "WARN")
+            self.results['eigenvalue_spectrum'] = {'status': 'skipped_arch_mismatch'}
+            return self.results['eigenvalue_spectrum']
+            
+        entropy_diffs = []
+        rank_diffs = []
+        
+        for i, (m1, m2) in enumerate(zip(matrices1, matrices2)):
+            if m1.shape != m2.shape: continue
+            
+            try:
+                # 1. Compute Singular Values (The 'Energy' of the layer)
+                # svd returns sorted singular values
+                _, s1, _ = svd(m1, full_matrices=False)
+                _, s2, _ = svd(m2, full_matrices=False)
+                
+                # 2. Compute Spectral Entropy (The 'IQ' of the layer)
+                # Normalize sum to 1 to treat as probabilities
+                p1 = s1 / np.sum(s1)
+                p2 = s2 / np.sum(s2)
+                
+                # Entropy = -sum(p * log(p))
+                h1 = -np.sum(p1 * np.log(p1 + 1e-12))
+                h2 = -np.sum(p2 * np.log(p2 + 1e-12))
+                
+                # Check absolute difference in entropy
+                entropy_diffs.append(abs(h1 - h2))
+                
+                # 3. Compute Effective Rank (How many dims strictly needed?)
+                # Count how many singular values are needed to explain 99% of variance
+                def effective_rank(s):
+                    cum_energy = np.cumsum(s) / np.sum(s)
+                    return np.searchsorted(cum_energy, 0.99) + 1
+                
+                r1 = effective_rank(s1)
+                r2 = effective_rank(s2)
+                
+                # Relative rank difference
+                rank_diff = abs(r1 - r2) / max(r1, r2)
+                rank_diffs.append(rank_diff)
+                
+            except Exception as e:
+                pass # Skip broken layers
+        
+        # Average differences (Lower is more suspicious)
+        avg_entropy_diff = np.mean(entropy_diffs) if entropy_diffs else 1.0
+        avg_rank_diff = np.mean(rank_diffs) if rank_diffs else 1.0
+        
+        self.results['eigenvalue_spectrum'] = {
+            'avg_entropy_diff': float(avg_entropy_diff),
+            'avg_rank_diff': float(avg_rank_diff)
+        }
+        
+        # VERDICT LOGIC
+        # If entropy diff is tiny (< 0.05), it means the layers hold the exact same amount of information.
+        # This is very hard to achieve by accident.
+        
+        if avg_entropy_diff < 0.02 and avg_rank_diff < 0.02:
+            verdict = "[CRIT] IDENTICAL COMPLEXITY (TL)"
+            c = Atomic.RED
+        elif avg_entropy_diff < 0.1:
+            verdict = "[WARN] SIMILAR COMPLEXITY"
+            c = Atomic.YELLOW
+        else:
+            verdict = "[SAFE] DISTINCT INFORMATION"
+            c = Atomic.GREEN
+        
+        # Invert the metric for display so "Higher" = "More Similar" (easier for users to read)
+        display_score = max(0, 1.0 - avg_entropy_diff)
+        
+        Atomic.kv("Entropy Similarity", f"{display_score:.4f}", c)
+        Atomic.kv("Rank Diff", f"{avg_rank_diff:.4f}", Atomic.WHITE)
+        Atomic.kv("Verdict", verdict, c)
+        
+        self.results['eigenvalue_spectrum']['verdict'] = verdict
+        return self.results['eigenvalue_spectrum']
+    
+    def analyze_transfer_learning_signature(self) -> Dict:
+        """
+        [NEW METHOD 3/8] Detect specific transfer learning patterns
+        Early layers similar + late layers different = classic TL signature
+        """
+        Atomic.section("TRANSFER LEARNING SIGNATURE", 9)
+        
+        def get_layer_weights(model_dict):
+            weights = []
+            for key in ['shared_head', 'policy']:
+                if key in model_dict:
+                    for name, param in model_dict[key].named_parameters():
+                        if 'weight' in name:
+                            weights.append(param.detach().cpu().numpy())
+            return weights
+        
+        weights1 = get_layer_weights(self.original_model)
+        weights2 = get_layer_weights(self.suspicious_model)
+        
+        if len(weights1) != len(weights2):
+            self.results['transfer_signature'] = {
+                'signature_detected': False,
+                'reason': 'different_architectures'
+            }
+            Atomic.log("Cannot detect signature: different architectures", "WARN")
+            return self.results['transfer_signature']
+        
+        # Compute similarity for each layer
+        layer_similarities = []
+        for w1, w2 in zip(weights1, weights2):
+            if w1.shape == w2.shape:
+                w1_flat = w1.flatten()
+                w2_flat = w2.flatten()
+                sim = 1 - cosine(w1_flat, w2_flat)
+                layer_similarities.append(sim)
+            else:
+                layer_similarities.append(0)
+        
+        self.results['transfer_signature'] = {
+            'layer_similarities': [float(s) for s in layer_similarities]
+        }
+        
+        # Check for transfer learning pattern
+        if len(layer_similarities) >= 3:
+            early_avg = np.mean(layer_similarities[:len(layer_similarities)//2])
+            late_avg = np.mean(layer_similarities[len(layer_similarities)//2:])
+            
+            # Transfer learning signature: early layers similar, later different
+            if early_avg > 0.8 and late_avg < 0.6:
+                self.results['transfer_signature']['signature_detected'] = True
+                self.results['transfer_signature']['pattern'] = 'CLASSIC_TL: early_frozen_late_trained'
+                verdict = "[CRIT] CLASSIC TRANSFER LEARNING PATTERN"
+                c = Atomic.RED
+            elif early_avg > 0.9 and late_avg > 0.9:
+                self.results['transfer_signature']['signature_detected'] = True
+                self.results['transfer_signature']['pattern'] = 'FULL_COPY: entire_model_stolen'
+                verdict = "[CRIT] FULL MODEL COPY"
+                c = Atomic.RED
+            else:
+                self.results['transfer_signature']['signature_detected'] = False
+                verdict = "[SAFE] NO TL SIGNATURE"
+                c = Atomic.GREEN
+            
+            self.results['transfer_signature']['early_similarity'] = float(early_avg)
+            self.results['transfer_signature']['late_similarity'] = float(late_avg)
+            
+            Atomic.kv("Early Layers", f"{early_avg:.4f}", Atomic.WHITE)
+            Atomic.kv("Late Layers", f"{late_avg:.4f}", Atomic.WHITE)
+            Atomic.kv("Verdict", verdict, c)
+        else:
+            self.results['transfer_signature']['signature_detected'] = False
+            self.results['transfer_signature']['reason'] = 'insufficient_layers'
+            Atomic.log("Not enough layers for signature detection", "WARN")
+        
+        return self.results['transfer_signature']
+    
+    def analyze_decision_boundaries(self, num_samples: int = 200) -> Dict:
+        """
+        [NEW METHOD 4/8] Compare decision boundaries using perturbations
+        """
+        Atomic.section("DECISION BOUNDARY ANALYSIS", 10)
+        
+        obs_size = min(self.original_cfg.obs_size, self.suspicious_cfg.obs_size)
+        base_states = torch.randn(num_samples, obs_size).to(self.device)
+        
+        boundary_agreements = []
+        
+        with torch.no_grad():
+            def get_pred(model_dict, x):
+                if 'shared_head' in model_dict:
+                    x = model_dict['shared_head'](x)
+                if 'policy' in model_dict:
+                    x = model_dict['policy'](x)
+                return torch.argmax(x, dim=-1)
+            
+            # Test perturbations around each state
+            for i in range(min(50, num_samples)):
+                base = base_states[i:i+1]
+                
+                # Generate perturbations
+                perturbations = []
+                for _ in range(10):
+                    noise = torch.randn_like(base) * 0.1
+                    perturbations.append(base + noise)
+                
+                perturbations = torch.cat(perturbations, dim=0)
+                
+                # Pad/crop for each model
+                if self.original_cfg.obs_size > obs_size:
+                    p1 = F.pad(perturbations, (0, self.original_cfg.obs_size - obs_size))
+                else:
+                    p1 = perturbations[:, :self.original_cfg.obs_size]
+                
+                if self.suspicious_cfg.obs_size > obs_size:
+                    p2 = F.pad(perturbations, (0, self.suspicious_cfg.obs_size - obs_size))
+                else:
+                    p2 = perturbations[:, :self.suspicious_cfg.obs_size]
+                
+                perturbed_pred1 = get_pred(self.original_model, p1)
+                perturbed_pred2 = get_pred(self.suspicious_model, p2)
+                
+                agreement = (perturbed_pred1 == perturbed_pred2).float().mean().item()
+                boundary_agreements.append(agreement)
+        
+        avg_agreement = np.mean(boundary_agreements) if boundary_agreements else 0
+        std_agreement = np.std(boundary_agreements) if boundary_agreements else 0
+        
+        self.results['decision_boundaries'] = {
+            'boundary_agreement': float(avg_agreement),
+            'boundary_std': float(std_agreement)
+        }
+        
+        if avg_agreement > 0.8:
+            verdict = "[CRIT] IDENTICAL DECISION BOUNDARIES"
+            c = Atomic.RED
+        elif avg_agreement > 0.6:
+            verdict = "[WARN] SIMILAR BOUNDARIES"
+            c = Atomic.YELLOW
+        else:
+            verdict = "[SAFE] DIFFERENT BOUNDARIES"
+            c = Atomic.GREEN
+        
+        Atomic.kv("Boundary Agreement", f"{avg_agreement:.4f}", c)
+        Atomic.kv("Std Dev", f"{std_agreement:.4f}", Atomic.WHITE)
+        Atomic.kv("Verdict", verdict, c)
+        
+        self.results['decision_boundaries']['verdict'] = verdict
+        return self.results['decision_boundaries']
+    
+    def analyze_temporal_consistency(self, num_sequences: int = 20) -> Dict:
+        """
+        [NEW METHOD 5/8] Analyze how decisions evolve over game sequences
+        """
+        Atomic.section("TEMPORAL CONSISTENCY", 11)
+        
+        sequence_length = 10
+        sequence_agreements = []
+        
+        with torch.no_grad():
+            for _ in range(num_sequences):
+                # Start with kickoff
+                kickoff = generate_kickoff_states(1)[0]
+                
+                # Evolve state
+                sequence = [kickoff]
+                for _ in range(sequence_length - 1):
+                    next_state = sequence[-1].copy()
+                    # Update ball position
+                    next_state[0:3] += next_state[3:6] * 0.1
+                    # Add noise
+                    next_state += np.random.randn(109) * 0.05
+                    next_state = np.clip(next_state, -2, 2)
+                    sequence.append(next_state)
+                
+                sequence_tensor = torch.from_numpy(np.array(sequence)).float().to(self.device)
+                
+                # Pad/crop for each model
+                if self.original_cfg.obs_size > 109:
+                    seq1 = F.pad(sequence_tensor, (0, self.original_cfg.obs_size - 109))
+                else:
+                    seq1 = sequence_tensor[:, :self.original_cfg.obs_size]
+                
+                if self.suspicious_cfg.obs_size > 109:
+                    seq2 = F.pad(sequence_tensor, (0, self.suspicious_cfg.obs_size - 109))
+                else:
+                    seq2 = sequence_tensor[:, :self.suspicious_cfg.obs_size]
+                
+                # Get action sequences
+                def get_action_sequence(model_dict, states):
+                    actions = []
+                    for state in states:
+                        x = state.unsqueeze(0)
+                        if 'shared_head' in model_dict:
+                            x = model_dict['shared_head'](x)
+                        if 'policy' in model_dict:
+                            x = model_dict['policy'](x)
+                        action = torch.argmax(x, dim=-1).item()
+                        actions.append(action)
+                    return actions
+                
+                actions1 = get_action_sequence(self.original_model, seq1)
+                actions2 = get_action_sequence(self.suspicious_model, seq2)
+                
+                agreement = sum(a1 == a2 for a1, a2 in zip(actions1, actions2)) / sequence_length
+                sequence_agreements.append(agreement)
+        
+        avg_agreement = np.mean(sequence_agreements) if sequence_agreements else 0
+        std_agreement = np.std(sequence_agreements) if sequence_agreements else 0
+        
+        self.results['temporal_consistency'] = {
+            'temporal_agreement': float(avg_agreement),
+            'temporal_std': float(std_agreement)
+        }
+        
+        if avg_agreement > 0.75:
+            verdict = "[CRIT] IDENTICAL TEMPORAL BEHAVIOR"
+            c = Atomic.RED
+        elif avg_agreement > 0.6:
+            verdict = "[WARN] SIMILAR TEMPORAL PATTERNS"
+            c = Atomic.YELLOW
+        else:
+            verdict = "[SAFE] DIFFERENT TEMPORAL BEHAVIOR"
+            c = Atomic.GREEN
+        
+        Atomic.kv("Temporal Agreement", f"{avg_agreement:.4f}", c)
+        Atomic.kv("Std Dev", f"{std_agreement:.4f}", Atomic.WHITE)
+        Atomic.kv("Verdict", verdict, c)
+        
+        self.results['temporal_consistency']['verdict'] = verdict
+        return self.results['temporal_consistency']
+    
+    # ==================== END ADVANCED METHODS ====================
+    
     def run_full_analysis(self) -> Dict:
         """Run complete analysis"""
         Atomic.banner()
@@ -1146,6 +2176,33 @@ class TransferLearningDetector:
             self.analyze_behavior_similarity()
         except Exception as e:
             Atomic.log(f"Behavior analysis failed: {e}", "CRIT")
+        
+        # ==================== NEW ADVANCED METHODS ====================
+        try:
+            self.analyze_kickoff_behavior()
+        except Exception as e:
+            Atomic.log(f"Kickoff analysis failed: {e}", "CRIT")
+        
+        try:
+            self.analyze_eigenvalue_spectrum()
+        except Exception as e:
+            Atomic.log(f"Eigenvalue analysis failed: {e}", "CRIT")
+        
+        try:
+            self.analyze_transfer_learning_signature()
+        except Exception as e:
+            Atomic.log(f"TL signature analysis failed: {e}", "CRIT")
+        
+        try:
+            self.analyze_decision_boundaries()
+        except Exception as e:
+            Atomic.log(f"Decision boundary analysis failed: {e}", "CRIT")
+        
+        try:
+            self.analyze_temporal_consistency()
+        except Exception as e:
+            Atomic.log(f"Temporal consistency analysis failed: {e}", "CRIT")
+        # ==================== END NEW METHODS ====================
         
         self.compute_final_verdict()
         
