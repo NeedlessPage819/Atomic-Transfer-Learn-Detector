@@ -10,7 +10,7 @@ this tool compares two rocket league bot models (specifically gigalearn/rlgym-cp
 
 ## 🔧 how it works (simplified)
 
-i drew this instead of sleeping. basically, we load both bots, rip their brains out, and poke them with math until they confess.
+i made this instead of sleeping. basically, we load both bots, rip their brains out, and poke them with math until they confess.
 
 ```
 ┌─────────────────┐         ┌─────────────────┐
