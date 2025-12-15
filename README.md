@@ -6,7 +6,7 @@
 
 i wrote this because i got tired of people stealing reinforcement learning models and claiming they "found the same local minima by accident." sure you did, buddy.
 
-this tool compares two rocket league bot models (specifically gigalearn/rlgym-cpp ones) and runs a battery of 8 distinct statistical tests to tell you if bot b is just bot a with a fake mustache.
+this tool compares two rocket league bot models (specifically gigalearn/rlgym-cpp ones) and runs a battery of **11 distinct statistical tests** to tell you if bot b is just bot a with a fake mustache.
 
 ## 🔧 how it works (simplified)
 
@@ -41,6 +41,9 @@ i drew this instead of sleeping. basically, we load both bots, rip their brains 
            │  6. behavior matching │
            │  7. kickoff simul     │
            │  8. spectral entropy  │
+           │  9. tl signature      │
+           │ 10. boundary check    │
+           │ 11. temporal sanity   │
            └───────────┬───────────┘
                        │
                        ▼
@@ -111,33 +114,29 @@ python tl_detector.py original.json sus.json --device cuda
 
 ## 🔬 detection methods (the science bit)
 
-we use a point system. max score is like 40 or something. honestly i lost count.
+we use a point system. max score is like 50 or something. honestly who counts anymore.
 
 ### 1. weight similarity (the smoking gun)
 **what it does:** checks if the raw numbers in the neural net are identical.
-**interpretation:**
-- **>95%**: ctrl+c, ctrl+v. go to jail.
-- **<60%**: probably innocent, or they retrained it enough to hide the crime.
+**verdict:** >95% match means go to jail. do not pass go.
 
 ### 2. cka (centered kernel alignment)
 **what it does:** compares the "internal representation" of data.
 **why:** even if they change the layer sizes, cka can sometimes tell if the "knowledge" is the same. it's basically checking if the bots have the same soul.
 
-### 3. distribution similarity (kl divergence)
-**what it does:** checks if the bots output the same probabilities for actions.
-**why:** if bot A says "jump 90%, boost 10%" and bot B says "jump 89%, boost 11%", that's suspicious.
+### 3. kickoff behavior & temporal consistency
+**what it does:** forces both bots to play 100 kickoffs in a simulation and checks how their decisions evolve over time.
+**verdict:** if they do the *exact* same pixel-perfect speedflip or panic in the exact same way, that's not a coincidence.
 
-### 4. kickoff behavior
-**what it does:** forces both bots to play 100 kickoffs in a simulation.
-**verdict:** if they do the *exact* same pixel-perfect speedflip, that's not a coincidence. that's a copy.
-
-### 5. spectral entropy
-**what it does:** checks the complexity of the information flow in the layers.
-**why:** copied nets tend to preserve the eigenvalue spectrum even after fine-tuning. don't ask me to explain the linear algebra, i just imported `scipy`.
-
-### 6. transfer learning signature
+### 4. transfer learning signature
 **what it does:** looks for the "frozen layers" pattern.
 **the pattern:** early layers are identical (frozen), later layers are different (fine-tuned). classic lazy developer move.
+
+### 5. spectral entropy
+**what it does:** checks the information density of the layers using eigenvalues.
+**why:** copied nets tend to preserve the complexity fingerprint even after fine-tuning.
+
+*(plus 6 other tests i am too tired to list here, just read the code)*
 
 ## 📊 interpreting results
 
