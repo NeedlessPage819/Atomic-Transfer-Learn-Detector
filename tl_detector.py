@@ -1243,7 +1243,8 @@ class NeuralLineageDetector:
                 p_params = dict(self.parent_model[key].named_parameters())
                 c_params = dict(self.child_model[key].named_parameters())
                 for name in p_params:
-                    if name in c_params:
+                    # FIX: Check shapes to prevent crash if hidden layer sizes differ
+                    if name in c_params and p_params[name].data.shape == c_params[name].data.shape:
                         delta[key][name] = c_params[name].data - p_params[name].data
         return delta
     
@@ -1538,6 +1539,12 @@ class TransferLearningDetector:
                 verdict = "[SAFE] NO DIRECT MATCHES"
                 c = Atomic.GREEN
         
+        # Show detailed layer matches
+        if matches_found:
+            print(f"\n{Atomic.GREY}Weight Matrix Matches:{Atomic.RESET}")
+            for match in matches_found[:5]:  # Show top 5 matches
+                print(f"  {match['original'][:35]:35} -> {match['suspect'][:35]:35} {Atomic.RED}{match['similarity']:.2%}{Atomic.RESET}")
+
         Atomic.kv("Max Similarity", f"{max_similarity:.4f}", Atomic.WHITE)
         Atomic.kv("Stolen Layers", f"{num_matches}/{total_layers_sus}", Atomic.RED if num_matches > 0 else Atomic.GREEN)
         Atomic.kv("Verdict", verdict, Atomic.WHITE)
@@ -1607,6 +1614,14 @@ class TransferLearningDetector:
             verdict = "[LOW] WEAK CORRELATION"
             c = Atomic.GREEN
         
+        # Show detailed activation correlation statistics
+        if correlations:
+            high_corr = sum(1 for c in correlations if c > 0.8) / len(correlations)
+            print(f"\n{Atomic.GREY}Activation Correlation Details:{Atomic.RESET}")
+            print(f"  High Correlations (>0.8): {high_corr:.1%} ({sum(1 for c in correlations if c > 0.8)}/{len(correlations)})")
+            print(f"  Mean Correlation: {np.mean(correlations):.4f}")
+            print(f"  Std Correlation: {np.std(correlations):.4f}")
+
         Atomic.kv("Spearman Corr", f"{avg_corr:.4f}", c)
         Atomic.kv("Cosine Sim", f"{avg_cos:.4f}", c)
         Atomic.kv("Verdict", verdict, c)
@@ -1796,6 +1811,13 @@ class TransferLearningDetector:
             verdict = "[SAFE] LOW SIMILARITY"
         
         c = Atomic.RED if "EXTREME" in verdict else (Atomic.YELLOW if "HIGH" in verdict else Atomic.GREEN)
+        # Show detailed distribution statistics
+        if kl_divs:
+            print(f"\n{Atomic.GREY}Distribution Divergence Details:{Atomic.RESET}")
+            print(f"  KL Div Range: {np.min(kl_divs):.4f} - {np.max(kl_divs):.4f}")
+            print(f"  JS Div Range: {np.min(js_divs):.4f} - {np.max(js_divs):.4f}")
+            print(f"  Samples Analyzed: {len(kl_divs)}")
+
         Atomic.kv("KL Divergence", f"{avg_kl:.4f}", c)
         Atomic.kv("JS Divergence", f"{avg_js:.4f}", c)
         Atomic.kv("Verdict", verdict, c)
@@ -2199,9 +2221,17 @@ class TransferLearningDetector:
             verdict = "[SAFE] DISTINCT INFORMATION"
             c = Atomic.GREEN
         
+        # Show detailed per-layer entropy analysis
+        if entropy_diffs:
+            print(f"\n{Atomic.GREY}Per-Layer Entropy Analysis:{Atomic.RESET}")
+            for i, entropy_diff in enumerate(entropy_diffs):
+                similarity = max(0, 1.0 - entropy_diff)
+                color = Atomic.RED if similarity > 0.95 else (Atomic.YELLOW if similarity > 0.8 else Atomic.GREEN)
+                print(f"  Layer {i}: Entropy diff {entropy_diff:.4f} -> {similarity:.2f} similarity {color}{'■' if similarity > 0.9 else '□'}{Atomic.RESET}")
+
         # Invert the metric for display so "Higher" = "More Similar" (easier for users to read)
         display_score = max(0, 1.0 - avg_entropy_diff)
-        
+
         Atomic.kv("Entropy Similarity", f"{display_score:.4f}", c)
         Atomic.kv("Rank Diff", f"{avg_rank_diff:.4f}", Atomic.WHITE)
         Atomic.kv("Verdict", verdict, c)
@@ -2275,6 +2305,14 @@ class TransferLearningDetector:
             self.results['transfer_signature']['early_similarity'] = float(early_avg)
             self.results['transfer_signature']['late_similarity'] = float(late_avg)
             
+            # Show detailed layer-by-layer similarities
+            if layer_similarities:
+                print(f"\n{Atomic.GREY}Layer Similarity Details:{Atomic.RESET}")
+                for i, sim in enumerate(layer_similarities):
+                    layer_type = "Early" if i < len(layer_similarities)//2 else "Late"
+                    color = Atomic.RED if sim > 0.95 else (Atomic.YELLOW if sim > 0.8 else Atomic.GREEN)
+                    print(f"  Layer {i:2d} ({layer_type:5}): {sim:.4f} {color}{'■' if sim > 0.9 else '□'}{Atomic.RESET}")
+
             Atomic.kv("Early Layers", f"{early_avg:.4f}", Atomic.WHITE)
             Atomic.kv("Late Layers", f"{late_avg:.4f}", Atomic.WHITE)
             Atomic.kv("Verdict", verdict, c)
