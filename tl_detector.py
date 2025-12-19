@@ -2589,8 +2589,8 @@ class TransferLearningDetector:
         # --- PHASE 3: CALCULATE CONFIDENCE ---
         
         if smoking_gun:
-            confidence = 99.9
-            final_verdict = "CONFIRMED COPY / TRANSFER LEARNING"
+            confidence = 100.0
+            final_verdict = "CONFIRMED COPY / TRANSFER LEARNING\nGRRR HOW DARE YOU TRANSFER LEARN FROM ANOTHER BOT YOU LITTLE FUCKING RETARD, LEARN TO MAKE YOUR OWN BOT INSTEAD OF TRANSFER LEARNING LIKE A FUCKASS RETARD GRRRR"
             color = Atomic.RED
         else:
             confidence = (score / max_score * 100) if max_score > 0 else 0
@@ -2736,7 +2736,7 @@ def main():
     except Exception as e:
         Atomic.log(f"Config load failed: {e}", "CRIT")
         sys.exit(1)
-    
+     
     # Create detector
     detector = TransferLearningDetector(
         original_cfg,
