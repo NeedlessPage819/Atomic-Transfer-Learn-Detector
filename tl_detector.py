@@ -830,9 +830,12 @@ class BotConfiguration:
 
 class NeuralLineageDetector:
     """
-    detects if one bot is the daddy of another using taylor expansion.
-    implemented from "neural lineage" (cvpr 2024).
-    i skimmed the paper, hope this works.
+    Detects if one bot is the parent of another using Neural Tangent Kernel (NTK) linearization.
+    Implemented based on 'Neural Lineage' (CVPR 2024).
+    
+    References:
+    - Proposition 1: Taylor Expansion for Similarity Approximation
+    - Section 1 / Fig 1c: Sub-network Lineage Detection
     """
     
     def __init__(self, parent_model: Dict, child_model: Dict, 
@@ -844,137 +847,148 @@ class NeuralLineageDetector:
         self.child_cfg = child_cfg
         self.device = device
         
-    def compute_linearized_output(self, model_dict: Dict, input_tensor: torch.Tensor,
-                                  param_delta: Dict = None, alpha: float = 1.0) -> torch.Tensor:
+    def _compute_parameter_delta(self) -> Dict:
         """
-        computes f(x) + grad * delta.
-        linear approximation of fine-tuning. math magic.
+        Computes theta_child - theta_parent.
+        Strictly handles shape mismatches to allow Sub-Network Lineage detection
+        without crashing on mismatched layers.
         """
-        if param_delta is None:
-            return self._get_model_output(model_dict, input_tensor)
-        
-        # turn on gradients, regret life choices
-        for key in model_dict:
-            if isinstance(model_dict[key], nn.Module):
-                for param in model_dict[key].parameters():
-                    param.requires_grad = True
-        
-        # forward pass
-        x = input_tensor.clone().requires_grad_(False)
-        if 'shared_head' in model_dict:
-            x = model_dict['shared_head'](x)
-        if 'policy' in model_dict:
-            x = model_dict['policy'](x)
-        
-        base_output = x.clone()
-        
-        # compute jacobian-ish thing
-        # we sum outputs to make it scalar because i'm not computing a full jacobian for a 109-dim vector
-        weighted_output = x.sum()
-        weighted_output.backward(retain_graph=False)
-        
-        # apply delta * grad
-        linear_correction = 0.0
+        delta = {}
         for key in ['shared_head', 'policy']:
-            if key in model_dict and key in param_delta:
-                for (name1, p1), (name2, p2) in zip(
-                    model_dict[key].named_parameters(),
-                    param_delta[key].items()
-                ):
-                    if p1.grad is not None and name1 == name2:
-                        delta = p2 - p1.data
-                        linear_correction += (p1.grad * delta).sum()
-        
-        # clean up
-        for key in model_dict:
-            if isinstance(model_dict[key], nn.Module):
-                model_dict[key].zero_grad()
-        
-        return base_output + alpha * linear_correction
-    
+            if key in self.parent_model and key in self.child_model:
+                delta[key] = {}
+                p_params = dict(self.parent_model[key].named_parameters())
+                c_params = dict(self.child_model[key].named_parameters())
+                for name in p_params:
+                    # CRITICAL: Only calculate delta for layers that structurally match.
+                    # This allows detecting "Organs" stolen from the "Body".
+                    if name in c_params and p_params[name].data.shape == c_params[name].data.shape:
+                        delta[key][name] = c_params[name].data - p_params[name].data
+        return delta
+
     def compute_similarity_with_linearization(self, metric: str = 'l2',
                                             num_samples: int = 500,
                                             alpha: float = 1.0) -> Dict:
         """
-        check similarity between linearized parent and child.
-        if this is high, someone definitely stole your homework.
+        Exact implementation of Neural Lineage (Prop 1).
+        The Paper states: s(fp_lin, fc) approx s(fp, fc) + <grad_s, theta_c - theta_p>
         """
-        Atomic.section(f"NEURAL LINEAGE: {metric.upper()} WITH LINEARIZATION")
+        Atomic.section(f"NEURAL LINEAGE: {metric.upper()} (EXACT TAYLOR)")
         
         obs_size = min(self.parent_cfg.obs_size, self.child_cfg.obs_size)
         test_inputs = torch.randn(num_samples, obs_size).to(self.device)
         
-        # pad/crop inputs because people can't agree on obs sizes
         parent_inputs = self._prepare_inputs(test_inputs, self.parent_cfg.obs_size, obs_size)
         child_inputs = self._prepare_inputs(test_inputs, self.child_cfg.obs_size, obs_size)
         
+        # 1. Compute Parameter Delta (The vector pointing from Parent to Child)
         param_delta = self._compute_parameter_delta()
+        if not any(len(d) > 0 for d in param_delta.values()):
+            Atomic.log("No matching layers found for Linearization.", "WARN")
+            return {'verdict': '[SAFE] NO ARCHITECTURE OVERLAP'}
+
+        # 2. Enable gradients on parent model (Essential for Taylor Expansion)
+        for key in self.parent_model:
+            if isinstance(self.parent_model[key], nn.Module):
+                for param in self.parent_model[key].parameters():
+                    param.requires_grad = True
+                    param.grad = None
         
-        similarities = []
+        total_base_sim = 0.0
+        total_linear_sim = 0.0
+        batch_size = 50
         
-        with torch.no_grad():
-            child_output = self._get_model_output(self.child_model, child_inputs)
-            
-            # batch processing so my gpu doesn't explode
-            batch_size = 100
+        try:
             for i in range(0, num_samples, batch_size):
+                # Zero gradients before each batch
+                for key in self.parent_model:
+                    if isinstance(self.parent_model[key], nn.Module):
+                        self.parent_model[key].zero_grad()
+
                 end_idx = min(i + batch_size, num_samples)
-                batch_parent = parent_inputs[i:end_idx]
-                batch_child = child_output[i:end_idx]
+                batch_p_in = parent_inputs[i:end_idx]
+                batch_c_in = child_inputs[i:end_idx]
+                current_batch_n = end_idx - i
                 
-                parent_output = self._get_model_output(self.parent_model, batch_parent)
+                # A. Child Forward (Target) - No Gradients needed here
+                with torch.no_grad():
+                    out_c = self._get_model_output(self.child_model, batch_c_in)
                 
+                # B. Parent Forward (Source) - Gradients REQUIRED for Jacobian
+                out_p = batch_p_in
+                if 'shared_head' in self.parent_model: out_p = self.parent_model['shared_head'](out_p)
+                if 'policy' in self.parent_model: out_p = self.parent_model['policy'](out_p)
+                
+                # C. Compute Base Similarity
+                diff = out_p - out_c
                 if metric == 'l2':
-                    diff = parent_output - batch_child
-                    sim = -torch.norm(diff, p=2, dim=-1).mean().item()
+                    # Negative L2 norm (closer to 0 is better)
+                    sim_scalar = -torch.norm(diff, p=2, dim=-1).mean()
                 elif metric == 'l1':
-                    diff = parent_output - batch_child
-                    sim = -torch.norm(diff, p=1, dim=-1).mean().item()
-                elif metric == 'cosine':
-                    sim = F.cosine_similarity(parent_output, batch_child, dim=-1).mean().item()
+                    sim_scalar = -torch.norm(diff, p=1, dim=-1).mean()
+                else:
+                    sim_scalar = F.cosine_similarity(out_p, out_c, dim=-1).mean()
+
+                total_base_sim += sim_scalar.item() * current_batch_n
                 
-                similarities.append(sim)
+                # D. Compute Gradient of Similarity w.r.t Parent Parameters
+                sim_scalar.backward()
+                
+                # E. Apply Taylor Expansion: sim_lin = sim_base + (grad * delta)
+                batch_correction = 0.0
+                for key in ['shared_head', 'policy']:
+                    if key in self.parent_model and key in param_delta:
+                        for name, param in self.parent_model[key].named_parameters():
+                            if name in param_delta[key] and param.grad is not None:
+                                d = param_delta[key][name]
+                                # Dot product of Gradient and Parameter Delta
+                                batch_correction += (param.grad * d).sum().item()
+                
+                total_linear_sim += (sim_scalar.item() + alpha * batch_correction) * current_batch_n
+
+        except Exception as e:
+            Atomic.log(f"Linearization math failed: {e}", "CRIT")
+            return {'verdict': '[ERR] MATH FAILURE'}
+        finally:
+            # SAFETY: Turn off gradients so we don't leak memory in the rest of the app
+            for key in self.parent_model:
+                if isinstance(self.parent_model[key], nn.Module):
+                    self.parent_model[key].zero_grad()
+                    for param in self.parent_model[key].parameters():
+                        param.requires_grad = False
+
+        avg_base = total_base_sim / num_samples
+        avg_linear = total_linear_sim / num_samples
         
-        avg_similarity = np.mean(similarities)
-        
-        # does the delta align with gradients?
-        param_alignment = self._compute_parameter_gradient_alignment(param_delta)
+        # F. Analyze Improvement
+        improvement = avg_linear - avg_base
         
         results = {
             'method': f'neural_lineage_{metric}',
-            'base_similarity': float(avg_similarity),
-            'param_gradient_alignment': float(param_alignment),
-            'combined_score': float(avg_similarity * (1 + param_alignment)),
-            'num_samples': num_samples
+            'base_similarity': float(avg_base),
+            'linearized_similarity': float(avg_linear),
+            'improvement_score': float(improvement)
         }
         
-        # verdict generation logic
-        combined = results['combined_score']
+        # Verdict Logic based on Neural Lineage Paper
         if metric in ['l2', 'l1']:
-            # distance metrics, higher (closer to 0) is better
-            if combined > -0.1:
-                verdict = "[CRIT] STRONG LINEAGE DETECTED"
+            if avg_linear > -0.1:
+                verdict = "[CRIT] STRONG LINEAGE CONFIRMED"
                 c = Atomic.RED
-            elif combined > -0.5:
-                verdict = "[WARN] POSSIBLE LINEAGE"
+            # POSITIVE Taylor Gain is the hallmark of lineage in fine-tuned models
+            elif improvement > 0.001: 
+                verdict = "[WARN] POSITIVE LINEAGE GRADIENT"
                 c = Atomic.YELLOW
             else:
                 verdict = "[SAFE] NO LINEAGE"
                 c = Atomic.GREEN
         else:
-            if combined > 0.9:
-                verdict = "[CRIT] STRONG LINEAGE DETECTED"
-                c = Atomic.RED
-            elif combined > 0.7:
-                verdict = "[WARN] POSSIBLE LINEAGE"
-                c = Atomic.YELLOW
-            else:
-                verdict = "[SAFE] NO LINEAGE"
-                c = Atomic.GREEN
+            if avg_linear > 0.9: verdict = "[CRIT] STRONG LINEAGE"; c = Atomic.RED
+            else: verdict = "[SAFE] NO LINEAGE"; c = Atomic.GREEN
         
-        Atomic.kv("Base Similarity", f"{avg_similarity:.4f}", Atomic.WHITE)
-        Atomic.kv("Param-Grad Alignment", f"{param_alignment:.4f}", Atomic.WHITE)
-        Atomic.kv("Combined Score", f"{combined:.4f}", c)
+        Atomic.kv("Base Similarity", f"{avg_base:.4f}", Atomic.WHITE)
+        Atomic.kv("Linearized Sim", f"{avg_linear:.4f}", Atomic.CYAN)
+        Atomic.kv("Taylor Gain", f"{improvement:.4f}", Atomic.WHITE)
         Atomic.kv("Verdict", verdict, c)
         
         results['verdict'] = verdict
@@ -982,8 +996,8 @@ class NeuralLineageDetector:
     
     def analyze_layer_wise_lineage(self) -> Dict:
         """
-        matches layers between parent and child.
-        basically tinder for neural networks.
+        Implements Sub-Network Lineage Detection (CVPR 2024, Fig 1c).
+        Identifies origin of specific layers even if architecture differs.
         """
         Atomic.section("LAYER-WISE LINEAGE ANALYSIS")
         
@@ -1004,12 +1018,13 @@ class NeuralLineageDetector:
         
         lineage_probabilities = []
         
-        # brute force matching
+        # Brute force O(N*M) matching
         for i, child_layer in enumerate(child_layers):
             child_flat = child_layer['param'].flatten()
             similarities = []
             
             for j, parent_layer in enumerate(parent_layers):
+                # We only compare layers that COULD be the same (Shape Match)
                 if child_layer['param'].shape == parent_layer['param'].shape:
                     parent_flat = parent_layer['param'].flatten()
                     cos_sim = 1 - cosine(child_flat, parent_flat)
@@ -1020,10 +1035,11 @@ class NeuralLineageDetector:
                     })
             
             if similarities:
+                # Sort by best match
                 similarities.sort(key=lambda x: x['similarity'], reverse=True)
                 best_match = similarities[0]
                 
-                # softmax over top 3 to get confidence
+                # Softmax to determine confidence among CANDIDATES.
                 top_sims = [s['similarity'] for s in similarities[:3]]
                 probs = np.exp(np.array(top_sims) * 10) / np.sum(np.exp(np.array(top_sims) * 10))
                 
@@ -1032,15 +1048,14 @@ class NeuralLineageDetector:
                     'child_name': child_layer['name'],
                     'most_likely_parent': best_match['parent_name'],
                     'probability': float(probs[0]),
-                    'similarity': float(best_match['similarity']),
-                    'top_3_matches': [{'parent': s['parent_name'], 'prob': float(p)} for s, p in zip(similarities[:3], probs)]
+                    'similarity': float(best_match['similarity'])
                 })
         
         if not lineage_probabilities:
             return {'method': 'layer_wise_lineage', 'verdict': '[SAFE] NO MATCHING LAYERS'}
 
         avg_prob = float(np.mean([l['probability'] for l in lineage_probabilities]))
-        high_conf = sum(1 for l in lineage_probabilities if l['probability'] > 0.8)
+        high_conf = sum(1 for l in lineage_probabilities if l['probability'] > 0.9)
         
         results = {
             'method': 'layer_wise_lineage',
@@ -1050,34 +1065,36 @@ class NeuralLineageDetector:
         }
         
         total_layers = len(lineage_probabilities)
-        if avg_prob > 0.8 and high_conf > total_layers * 0.7:
-            verdict = "[CRIT] CLEAR LAYER LINEAGE"
+        
+        # If we have unique matches (High Conf), we flag it.
+        if high_conf > 0:
+            verdict = "[CRIT] SUB-NETWORK LINEAGE DETECTED"
             c = Atomic.RED
-        elif avg_prob > 0.6:
-            verdict = "[WARN] PARTIAL LINEAGE"
+        elif avg_prob > 0.5:
+            verdict = "[WARN] POSSIBLE ANCESTRY"
             c = Atomic.YELLOW
         else:
             verdict = "[SAFE] NO CLEAR LINEAGE"
             c = Atomic.GREEN
         
         Atomic.kv("Avg Match Probability", f"{avg_prob:.4f}", c)
-        Atomic.kv("High-Conf Matches", f"{high_conf}/{total_layers}", c)
+        Atomic.kv("Unique Matches", f"{high_conf}/{total_layers}", c)
         Atomic.kv("Verdict", verdict, c)
         
         if lineage_probabilities:
             print(f"\n{Atomic.GREY}Layer Lineage Details:{Atomic.RESET}")
             for match in lineage_probabilities[:5]:
-                prob_color = Atomic.RED if match['probability'] > 0.8 else Atomic.GREEN
-                print(f"  {match['child_name'][:40]:40} -> {match['most_likely_parent'][:30]:30} {prob_color}{match['probability']:.2%}{Atomic.RESET}")
+                prob_color = Atomic.RED if match['probability'] > 0.9 else Atomic.GREEN
+                sim_str = f"(Sim: {match['similarity']:.2f})"
+                print(f"  {match['child_name'][:30]:30} -> {match['most_likely_parent'][:30]:30} {prob_color}{match['probability']:.2%} {Atomic.GREY}{sim_str}{Atomic.RESET}")
         
         results['verdict'] = verdict
         return results
-    
+
     def detect_fine_tuning_pattern(self) -> Dict:
         """
-        detects fine-tuning patterns.
-        early layers should change less than late layers.
-        if they are all the same, it's either scratch or a copy.
+        Detects fine-tuning patterns.
+        Early layers should change less than late layers.
         """
         Atomic.section("FINE-TUNING PATTERN DETECTION")
         
@@ -1094,7 +1111,8 @@ class NeuralLineageDetector:
         child_params = get_ordered_params(self.child_model)
         
         if len(parent_params) != len(child_params):
-            return {'status': 'architecture_mismatch'}
+            # Atomic.log("Skipping FT pattern: architectures differ", "INFO")
+            return {'status': 'architecture_mismatch', 'verdict': '[SAFE] ARCH MISMATCH'}
         
         layer_changes = []
         for parent, child in zip(parent_params, child_params):
@@ -1105,28 +1123,22 @@ class NeuralLineageDetector:
                 layer_changes.append(change)
         
         if len(layer_changes) < 3:
-            return {'status': 'insufficient_layers'}
+            return {'status': 'insufficient_layers', 'verdict': '[SAFE] TOO SMALL'}
         
         n = len(layer_changes)
         early_change = np.mean(layer_changes[:n//3])
         late_change = np.mean(layer_changes[2*n//3:])
-        change_gradient = (late_change - early_change) / len(layer_changes)
         
         results = {
             'method': 'fine_tuning_pattern',
             'early_layer_change': float(early_change),
-            'late_layer_change': float(late_change),
-            'change_gradient': float(change_gradient)
+            'late_layer_change': float(late_change)
         }
         
-        if early_change < 0.1 and late_change > 0.3 and change_gradient > 0:
+        if early_change < 0.1 and late_change > 0.3:
             pattern = "CLASSIC_FINE_TUNING"
             verdict = "[CRIT] CLASSIC FINE-TUNING DETECTED"
             c = Atomic.RED
-        elif early_change < 0.3 and late_change > early_change * 2:
-            pattern = "PARTIAL_FINE_TUNING"
-            verdict = "[WARN] PARTIAL FINE-TUNING"
-            c = Atomic.YELLOW
         elif all(c < 0.05 for c in layer_changes):
             pattern = "NEAR_IDENTICAL"
             verdict = "[CRIT] MODELS NEARLY IDENTICAL"
@@ -1141,15 +1153,13 @@ class NeuralLineageDetector:
         
         Atomic.kv("Early Layer Change", f"{early_change:.4f}", Atomic.WHITE)
         Atomic.kv("Late Layer Change", f"{late_change:.4f}", Atomic.WHITE)
-        Atomic.kv("Pattern", pattern, c)
         Atomic.kv("Verdict", verdict, c)
         
         return results
-    
+
     def compute_ntk_similarity(self, num_samples: int = 100) -> Dict:
         """
-        neural tangent kernel similarity.
-        if the ntk matches, they think alike. scarily alike.
+        Neural tangent kernel similarity.
         """
         Atomic.section("NEURAL TANGENT KERNEL SIMILARITY")
         
@@ -1171,7 +1181,7 @@ class NeuralLineageDetector:
             if 'policy' in model_dict: x = model_dict['policy'](x)
             
             ntk_features = []
-            # sample 10 output dims because i don't have all day
+            # sample 10 output dims
             for i in range(min(10, x.shape[-1])):
                 if x.requires_grad: x.retain_grad()
                 output_i = x[:, i].sum()
@@ -1189,6 +1199,8 @@ class NeuralLineageDetector:
                 for key in model_dict:
                     if isinstance(model_dict[key], nn.Module):
                         model_dict[key].zero_grad()
+                        for param in model_dict[key].parameters():
+                            param.requires_grad = False
             return np.array(ntk_features)
         
         try:
@@ -1222,64 +1234,18 @@ class NeuralLineageDetector:
         
         results['verdict'] = verdict
         return results
-    
-    # helpers
+
+    # helper
     def _get_model_output(self, model_dict: Dict, input_tensor: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            x = input_tensor
-            if 'shared_head' in model_dict: x = model_dict['shared_head'](x)
-            if 'policy' in model_dict: x = model_dict['policy'](x)
-            return x
+        # Just runs the model. Gradients are managed by the caller.
+        x = input_tensor
+        if 'shared_head' in model_dict: x = model_dict['shared_head'](x)
+        if 'policy' in model_dict: x = model_dict['policy'](x)
+        return x
     
     def _prepare_inputs(self, inputs: torch.Tensor, target_size: int, base_size: int) -> torch.Tensor:
         if target_size > base_size: return F.pad(inputs, (0, target_size - base_size))
         return inputs[:, :target_size]
-    
-    def _compute_parameter_delta(self) -> Dict:
-        delta = {}
-        for key in ['shared_head', 'policy']:
-            if key in self.parent_model and key in self.child_model:
-                delta[key] = {}
-                p_params = dict(self.parent_model[key].named_parameters())
-                c_params = dict(self.child_model[key].named_parameters())
-                for name in p_params:
-                    # FIX: Check shapes to prevent crash if hidden layer sizes differ
-                    if name in c_params and p_params[name].data.shape == c_params[name].data.shape:
-                        delta[key][name] = c_params[name].data - p_params[name].data
-        return delta
-    
-    def _compute_parameter_gradient_alignment(self, param_delta: Dict) -> float:
-        alignments = []
-        obs_size = min(self.parent_cfg.obs_size, self.child_cfg.obs_size)
-        test_input = torch.randn(10, obs_size).to(self.device)
-        test_input = self._prepare_inputs(test_input, self.parent_cfg.obs_size, obs_size)
-        
-        for key in self.parent_model:
-            if isinstance(self.parent_model[key], nn.Module):
-                for param in self.parent_model[key].parameters(): param.requires_grad = True
-        
-        x = test_input
-        if 'shared_head' in self.parent_model: x = self.parent_model['shared_head'](x)
-        if 'policy' in self.parent_model: x = self.parent_model['policy'](x)
-        
-        loss = x.sum()
-        loss.backward()
-        
-        for key in ['shared_head', 'policy']:
-            if key in self.parent_model and key in param_delta:
-                for name, param in self.parent_model[key].named_parameters():
-                    if name in param_delta[key] and param.grad is not None:
-                        delta = param_delta[key][name].flatten().cpu().numpy()
-                        grad = param.grad.flatten().cpu().numpy()
-                        if len(delta) > 0 and len(grad) > 0:
-                            min_len = min(len(delta), len(grad))
-                            alignment = 1 - cosine(delta[:min_len], -grad[:min_len])
-                            if not np.isnan(alignment): alignments.append(alignment)
-        
-        for key in self.parent_model:
-            if isinstance(self.parent_model[key], nn.Module): self.parent_model[key].zero_grad()
-        
-        return float(np.mean(alignments)) if alignments else 0.0
 
 
 class TransferLearningDetector:
