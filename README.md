@@ -162,6 +162,9 @@ the tool gives you a confidence score. here is the translation guide:
 **"both bots score high but i know they are different"**
 > did you train them on the exact same dataset with the exact same seed? well, there you go.
 
+## Credits
+Credits to this Paper https://openaccess.thecvf.com/content/CVPR2024/papers/Yu_Neural_Lineage_CVPR_2024_paper.pdf
+
 ## license
 
 The "Totally Not Our Fault" License (MIT)
