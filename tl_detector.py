@@ -10,17 +10,12 @@ import importlib.util
 import argparse
 from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
-from scipy.stats import spearmanr, pearsonr
-from scipy.spatial.distance import cosine
-import warnings
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
 from scipy.stats import spearmanr, pearsonr, ks_2samp
 from scipy.spatial.distance import cosine, euclidean
 from scipy.linalg import svd
 import warnings
+
+# silence is golden. warnings are annoying.
 warnings.filterwarnings('ignore')
 
 
@@ -199,7 +194,10 @@ def generate_realistic_game_states(num_states=100):
 
 
 class AdvancedDetectionMethods:
-    """Additional detection methods for the main detector"""
+    """
+    Additional detection methods for the main detector.
+    This code has been here since 2023. don't fucking touch it.
+    """
     
     @staticmethod
     def analyze_layer_features(model1_dict, model2_dict, device, num_samples=500):
@@ -582,10 +580,6 @@ __all__ = [
     'generate_realistic_game_states'
 ]
 
-# silence is golden. warnings are annoying.
-warnings.filterwarnings('ignore')
-
-
 # --- ATOMIC TERMINAL VISUALS (ASCII ONLY) ---
 class Atomic:
     PURPLE = '\033[95m'
@@ -647,7 +641,7 @@ class Atomic:
 
         # 4. Print Metadata (Grey/Dimmed)
         print(f"\n{Atomic.GREY}   Atomic // Transfer Learning Detector{Atomic.RESET}")
-        print(f"{Atomic.GREY}   v2.2 Improved accuracy{Atomic.RESET}\n")
+        print(f"{Atomic.GREY}   v2.2 Improved accuracy (plus neural lineage stuff now){Atomic.RESET}\n")
         
         # 5. Status Indicator
         print(f"   {Atomic.PURPLE}>>{Atomic.RESET} {Atomic.CYAN}SYSTEM READY{Atomic.RESET}\n")
@@ -665,7 +659,7 @@ class Atomic:
 
     @staticmethod
     def section(title, index=None):
-        idx_str = f"[{index}/11] " if index else ""
+        idx_str = f"[{index}/12] " if index else ""
         # simple ascii separator
         print(f"\n{Atomic.PURPLE}>>> {idx_str}{title} {Atomic.GREY}{'-'*(50-len(title)-len(idx_str))}{Atomic.RESET}")
 
@@ -834,6 +828,459 @@ class BotConfiguration:
         return self.config['architecture']
 
 
+class NeuralLineageDetector:
+    """
+    detects if one bot is the daddy of another using taylor expansion.
+    implemented from "neural lineage" (cvpr 2024).
+    i skimmed the paper, hope this works.
+    """
+    
+    def __init__(self, parent_model: Dict, child_model: Dict, 
+                 parent_cfg: BotConfiguration, child_cfg: BotConfiguration,
+                 device: torch.device):
+        self.parent_model = parent_model
+        self.child_model = child_model
+        self.parent_cfg = parent_cfg
+        self.child_cfg = child_cfg
+        self.device = device
+        
+    def compute_linearized_output(self, model_dict: Dict, input_tensor: torch.Tensor,
+                                  param_delta: Dict = None, alpha: float = 1.0) -> torch.Tensor:
+        """
+        computes f(x) + grad * delta.
+        linear approximation of fine-tuning. math magic.
+        """
+        if param_delta is None:
+            return self._get_model_output(model_dict, input_tensor)
+        
+        # turn on gradients, regret life choices
+        for key in model_dict:
+            if isinstance(model_dict[key], nn.Module):
+                for param in model_dict[key].parameters():
+                    param.requires_grad = True
+        
+        # forward pass
+        x = input_tensor.clone().requires_grad_(False)
+        if 'shared_head' in model_dict:
+            x = model_dict['shared_head'](x)
+        if 'policy' in model_dict:
+            x = model_dict['policy'](x)
+        
+        base_output = x.clone()
+        
+        # compute jacobian-ish thing
+        # we sum outputs to make it scalar because i'm not computing a full jacobian for a 109-dim vector
+        weighted_output = x.sum()
+        weighted_output.backward(retain_graph=False)
+        
+        # apply delta * grad
+        linear_correction = 0.0
+        for key in ['shared_head', 'policy']:
+            if key in model_dict and key in param_delta:
+                for (name1, p1), (name2, p2) in zip(
+                    model_dict[key].named_parameters(),
+                    param_delta[key].items()
+                ):
+                    if p1.grad is not None and name1 == name2:
+                        delta = p2 - p1.data
+                        linear_correction += (p1.grad * delta).sum()
+        
+        # clean up
+        for key in model_dict:
+            if isinstance(model_dict[key], nn.Module):
+                model_dict[key].zero_grad()
+        
+        return base_output + alpha * linear_correction
+    
+    def compute_similarity_with_linearization(self, metric: str = 'l2',
+                                            num_samples: int = 500,
+                                            alpha: float = 1.0) -> Dict:
+        """
+        check similarity between linearized parent and child.
+        if this is high, someone definitely stole your homework.
+        """
+        Atomic.section(f"NEURAL LINEAGE: {metric.upper()} WITH LINEARIZATION")
+        
+        obs_size = min(self.parent_cfg.obs_size, self.child_cfg.obs_size)
+        test_inputs = torch.randn(num_samples, obs_size).to(self.device)
+        
+        # pad/crop inputs because people can't agree on obs sizes
+        parent_inputs = self._prepare_inputs(test_inputs, self.parent_cfg.obs_size, obs_size)
+        child_inputs = self._prepare_inputs(test_inputs, self.child_cfg.obs_size, obs_size)
+        
+        param_delta = self._compute_parameter_delta()
+        
+        similarities = []
+        
+        with torch.no_grad():
+            child_output = self._get_model_output(self.child_model, child_inputs)
+            
+            # batch processing so my gpu doesn't explode
+            batch_size = 100
+            for i in range(0, num_samples, batch_size):
+                end_idx = min(i + batch_size, num_samples)
+                batch_parent = parent_inputs[i:end_idx]
+                batch_child = child_output[i:end_idx]
+                
+                parent_output = self._get_model_output(self.parent_model, batch_parent)
+                
+                if metric == 'l2':
+                    diff = parent_output - batch_child
+                    sim = -torch.norm(diff, p=2, dim=-1).mean().item()
+                elif metric == 'l1':
+                    diff = parent_output - batch_child
+                    sim = -torch.norm(diff, p=1, dim=-1).mean().item()
+                elif metric == 'cosine':
+                    sim = F.cosine_similarity(parent_output, batch_child, dim=-1).mean().item()
+                
+                similarities.append(sim)
+        
+        avg_similarity = np.mean(similarities)
+        
+        # does the delta align with gradients?
+        param_alignment = self._compute_parameter_gradient_alignment(param_delta)
+        
+        results = {
+            'method': f'neural_lineage_{metric}',
+            'base_similarity': float(avg_similarity),
+            'param_gradient_alignment': float(param_alignment),
+            'combined_score': float(avg_similarity * (1 + param_alignment)),
+            'num_samples': num_samples
+        }
+        
+        # verdict generation logic
+        combined = results['combined_score']
+        if metric in ['l2', 'l1']:
+            # distance metrics, higher (closer to 0) is better
+            if combined > -0.1:
+                verdict = "[CRIT] STRONG LINEAGE DETECTED"
+                c = Atomic.RED
+            elif combined > -0.5:
+                verdict = "[WARN] POSSIBLE LINEAGE"
+                c = Atomic.YELLOW
+            else:
+                verdict = "[SAFE] NO LINEAGE"
+                c = Atomic.GREEN
+        else:
+            if combined > 0.9:
+                verdict = "[CRIT] STRONG LINEAGE DETECTED"
+                c = Atomic.RED
+            elif combined > 0.7:
+                verdict = "[WARN] POSSIBLE LINEAGE"
+                c = Atomic.YELLOW
+            else:
+                verdict = "[SAFE] NO LINEAGE"
+                c = Atomic.GREEN
+        
+        Atomic.kv("Base Similarity", f"{avg_similarity:.4f}", Atomic.WHITE)
+        Atomic.kv("Param-Grad Alignment", f"{param_alignment:.4f}", Atomic.WHITE)
+        Atomic.kv("Combined Score", f"{combined:.4f}", c)
+        Atomic.kv("Verdict", verdict, c)
+        
+        results['verdict'] = verdict
+        return results
+    
+    def analyze_layer_wise_lineage(self) -> Dict:
+        """
+        matches layers between parent and child.
+        basically tinder for neural networks.
+        """
+        Atomic.section("LAYER-WISE LINEAGE ANALYSIS")
+        
+        def get_layer_params(model_dict):
+            layers = []
+            for key in ['shared_head', 'policy']:
+                if key in model_dict:
+                    for name, param in model_dict[key].named_parameters():
+                        if 'weight' in name and param.ndim == 2:
+                            layers.append({
+                                'name': f"{key}.{name}",
+                                'param': param.detach().cpu().numpy()
+                            })
+            return layers
+        
+        parent_layers = get_layer_params(self.parent_model)
+        child_layers = get_layer_params(self.child_model)
+        
+        lineage_probabilities = []
+        
+        # brute force matching
+        for i, child_layer in enumerate(child_layers):
+            child_flat = child_layer['param'].flatten()
+            similarities = []
+            
+            for j, parent_layer in enumerate(parent_layers):
+                if child_layer['param'].shape == parent_layer['param'].shape:
+                    parent_flat = parent_layer['param'].flatten()
+                    cos_sim = 1 - cosine(child_flat, parent_flat)
+                    similarities.append({
+                        'parent_layer': j,
+                        'parent_name': parent_layer['name'],
+                        'similarity': cos_sim
+                    })
+            
+            if similarities:
+                similarities.sort(key=lambda x: x['similarity'], reverse=True)
+                best_match = similarities[0]
+                
+                # softmax over top 3 to get confidence
+                top_sims = [s['similarity'] for s in similarities[:3]]
+                probs = np.exp(np.array(top_sims) * 10) / np.sum(np.exp(np.array(top_sims) * 10))
+                
+                lineage_probabilities.append({
+                    'child_layer': i,
+                    'child_name': child_layer['name'],
+                    'most_likely_parent': best_match['parent_name'],
+                    'probability': float(probs[0]),
+                    'similarity': float(best_match['similarity']),
+                    'top_3_matches': [{'parent': s['parent_name'], 'prob': float(p)} for s, p in zip(similarities[:3], probs)]
+                })
+        
+        if not lineage_probabilities:
+            return {'method': 'layer_wise_lineage', 'verdict': '[SAFE] NO MATCHING LAYERS'}
+
+        avg_prob = float(np.mean([l['probability'] for l in lineage_probabilities]))
+        high_conf = sum(1 for l in lineage_probabilities if l['probability'] > 0.8)
+        
+        results = {
+            'method': 'layer_wise_lineage',
+            'layer_matches': lineage_probabilities,
+            'avg_match_probability': avg_prob,
+            'high_confidence_matches': high_conf
+        }
+        
+        total_layers = len(lineage_probabilities)
+        if avg_prob > 0.8 and high_conf > total_layers * 0.7:
+            verdict = "[CRIT] CLEAR LAYER LINEAGE"
+            c = Atomic.RED
+        elif avg_prob > 0.6:
+            verdict = "[WARN] PARTIAL LINEAGE"
+            c = Atomic.YELLOW
+        else:
+            verdict = "[SAFE] NO CLEAR LINEAGE"
+            c = Atomic.GREEN
+        
+        Atomic.kv("Avg Match Probability", f"{avg_prob:.4f}", c)
+        Atomic.kv("High-Conf Matches", f"{high_conf}/{total_layers}", c)
+        Atomic.kv("Verdict", verdict, c)
+        
+        if lineage_probabilities:
+            print(f"\n{Atomic.GREY}Layer Lineage Details:{Atomic.RESET}")
+            for match in lineage_probabilities[:5]:
+                prob_color = Atomic.RED if match['probability'] > 0.8 else Atomic.GREEN
+                print(f"  {match['child_name'][:40]:40} -> {match['most_likely_parent'][:30]:30} {prob_color}{match['probability']:.2%}{Atomic.RESET}")
+        
+        results['verdict'] = verdict
+        return results
+    
+    def detect_fine_tuning_pattern(self) -> Dict:
+        """
+        detects fine-tuning patterns.
+        early layers should change less than late layers.
+        if they are all the same, it's either scratch or a copy.
+        """
+        Atomic.section("FINE-TUNING PATTERN DETECTION")
+        
+        def get_ordered_params(model_dict):
+            params = []
+            for key in ['shared_head', 'policy']:
+                if key in model_dict:
+                    for name, param in model_dict[key].named_parameters():
+                        if 'weight' in name:
+                            params.append({'name': f"{key}.{name}", 'param': param.detach().cpu().numpy()})
+            return params
+        
+        parent_params = get_ordered_params(self.parent_model)
+        child_params = get_ordered_params(self.child_model)
+        
+        if len(parent_params) != len(child_params):
+            return {'status': 'architecture_mismatch'}
+        
+        layer_changes = []
+        for parent, child in zip(parent_params, child_params):
+            if parent['param'].shape == child['param'].shape:
+                p_flat = parent['param'].flatten()
+                c_flat = child['param'].flatten()
+                change = np.linalg.norm(c_flat - p_flat) / (np.linalg.norm(p_flat) + 1e-10)
+                layer_changes.append(change)
+        
+        if len(layer_changes) < 3:
+            return {'status': 'insufficient_layers'}
+        
+        n = len(layer_changes)
+        early_change = np.mean(layer_changes[:n//3])
+        late_change = np.mean(layer_changes[2*n//3:])
+        change_gradient = (late_change - early_change) / len(layer_changes)
+        
+        results = {
+            'method': 'fine_tuning_pattern',
+            'early_layer_change': float(early_change),
+            'late_layer_change': float(late_change),
+            'change_gradient': float(change_gradient)
+        }
+        
+        if early_change < 0.1 and late_change > 0.3 and change_gradient > 0:
+            pattern = "CLASSIC_FINE_TUNING"
+            verdict = "[CRIT] CLASSIC FINE-TUNING DETECTED"
+            c = Atomic.RED
+        elif early_change < 0.3 and late_change > early_change * 2:
+            pattern = "PARTIAL_FINE_TUNING"
+            verdict = "[WARN] PARTIAL FINE-TUNING"
+            c = Atomic.YELLOW
+        elif all(c < 0.05 for c in layer_changes):
+            pattern = "NEAR_IDENTICAL"
+            verdict = "[CRIT] MODELS NEARLY IDENTICAL"
+            c = Atomic.RED
+        else:
+            pattern = "INDEPENDENT_TRAINING"
+            verdict = "[SAFE] NO FINE-TUNING PATTERN"
+            c = Atomic.GREEN
+        
+        results['detected_pattern'] = pattern
+        results['verdict'] = verdict
+        
+        Atomic.kv("Early Layer Change", f"{early_change:.4f}", Atomic.WHITE)
+        Atomic.kv("Late Layer Change", f"{late_change:.4f}", Atomic.WHITE)
+        Atomic.kv("Pattern", pattern, c)
+        Atomic.kv("Verdict", verdict, c)
+        
+        return results
+    
+    def compute_ntk_similarity(self, num_samples: int = 100) -> Dict:
+        """
+        neural tangent kernel similarity.
+        if the ntk matches, they think alike. scarily alike.
+        """
+        Atomic.section("NEURAL TANGENT KERNEL SIMILARITY")
+        
+        obs_size = min(self.parent_cfg.obs_size, self.child_cfg.obs_size)
+        test_inputs = torch.randn(num_samples, obs_size).to(self.device)
+        
+        parent_inputs = self._prepare_inputs(test_inputs, self.parent_cfg.obs_size, obs_size)
+        child_inputs = self._prepare_inputs(test_inputs, self.child_cfg.obs_size, obs_size)
+        
+        def compute_ntk_features(model_dict, inputs):
+            # turn on grads
+            for key in model_dict:
+                if isinstance(model_dict[key], nn.Module):
+                    for param in model_dict[key].parameters():
+                        param.requires_grad = True
+            
+            x = inputs
+            if 'shared_head' in model_dict: x = model_dict['shared_head'](x)
+            if 'policy' in model_dict: x = model_dict['policy'](x)
+            
+            ntk_features = []
+            # sample 10 output dims because i don't have all day
+            for i in range(min(10, x.shape[-1])):
+                if x.requires_grad: x.retain_grad()
+                output_i = x[:, i].sum()
+                output_i.backward(retain_graph=True)
+                
+                grad_norms = []
+                for key in ['shared_head', 'policy']:
+                    if key in model_dict:
+                        for param in model_dict[key].parameters():
+                            if param.grad is not None:
+                                grad_norms.append(param.grad.norm().item())
+                
+                ntk_features.append(np.mean(grad_norms))
+                
+                for key in model_dict:
+                    if isinstance(model_dict[key], nn.Module):
+                        model_dict[key].zero_grad()
+            return np.array(ntk_features)
+        
+        try:
+            parent_ntk = compute_ntk_features(self.parent_model, parent_inputs[:10])
+            child_ntk = compute_ntk_features(self.child_model, child_inputs[:10])
+            
+            if len(parent_ntk) > 0 and len(child_ntk) > 0:
+                min_len = min(len(parent_ntk), len(child_ntk))
+                ntk_correlation, _ = spearmanr(parent_ntk[:min_len], child_ntk[:min_len])
+                if np.isnan(ntk_correlation): ntk_correlation = 0.0
+            else:
+                ntk_correlation = 0.0
+        except Exception as e:
+            Atomic.log(f"ntk broke: {e}", "WARN")
+            ntk_correlation = 0.0
+        
+        results = {'method': 'ntk_similarity', 'ntk_correlation': float(ntk_correlation)}
+        
+        if ntk_correlation > 0.8:
+            verdict = "[CRIT] VERY SIMILAR NTK"
+            c = Atomic.RED
+        elif ntk_correlation > 0.6:
+            verdict = "[WARN] SIMILAR NTK"
+            c = Atomic.YELLOW
+        else:
+            verdict = "[SAFE] DIFFERENT NTK"
+            c = Atomic.GREEN
+        
+        Atomic.kv("NTK Correlation", f"{ntk_correlation:.4f}", c)
+        Atomic.kv("Verdict", verdict, c)
+        
+        results['verdict'] = verdict
+        return results
+    
+    # helpers
+    def _get_model_output(self, model_dict: Dict, input_tensor: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            x = input_tensor
+            if 'shared_head' in model_dict: x = model_dict['shared_head'](x)
+            if 'policy' in model_dict: x = model_dict['policy'](x)
+            return x
+    
+    def _prepare_inputs(self, inputs: torch.Tensor, target_size: int, base_size: int) -> torch.Tensor:
+        if target_size > base_size: return F.pad(inputs, (0, target_size - base_size))
+        return inputs[:, :target_size]
+    
+    def _compute_parameter_delta(self) -> Dict:
+        delta = {}
+        for key in ['shared_head', 'policy']:
+            if key in self.parent_model and key in self.child_model:
+                delta[key] = {}
+                p_params = dict(self.parent_model[key].named_parameters())
+                c_params = dict(self.child_model[key].named_parameters())
+                for name in p_params:
+                    if name in c_params:
+                        delta[key][name] = c_params[name].data - p_params[name].data
+        return delta
+    
+    def _compute_parameter_gradient_alignment(self, param_delta: Dict) -> float:
+        alignments = []
+        obs_size = min(self.parent_cfg.obs_size, self.child_cfg.obs_size)
+        test_input = torch.randn(10, obs_size).to(self.device)
+        test_input = self._prepare_inputs(test_input, self.parent_cfg.obs_size, obs_size)
+        
+        for key in self.parent_model:
+            if isinstance(self.parent_model[key], nn.Module):
+                for param in self.parent_model[key].parameters(): param.requires_grad = True
+        
+        x = test_input
+        if 'shared_head' in self.parent_model: x = self.parent_model['shared_head'](x)
+        if 'policy' in self.parent_model: x = self.parent_model['policy'](x)
+        
+        loss = x.sum()
+        loss.backward()
+        
+        for key in ['shared_head', 'policy']:
+            if key in self.parent_model and key in param_delta:
+                for name, param in self.parent_model[key].named_parameters():
+                    if name in param_delta[key] and param.grad is not None:
+                        delta = param_delta[key][name].flatten().cpu().numpy()
+                        grad = param.grad.flatten().cpu().numpy()
+                        if len(delta) > 0 and len(grad) > 0:
+                            min_len = min(len(delta), len(grad))
+                            alignment = 1 - cosine(delta[:min_len], -grad[:min_len])
+                            if not np.isnan(alignment): alignments.append(alignment)
+        
+        for key in self.parent_model:
+            if isinstance(self.parent_model[key], nn.Module): self.parent_model[key].zero_grad()
+        
+        return float(np.mean(alignments)) if alignments else 0.0
+
+
 class TransferLearningDetector:
     """Main detector class using bot configurations"""
     
@@ -875,6 +1322,13 @@ class TransferLearningDetector:
             Atomic.log(f"failed to load components: {e}", "WARN")
             self.suspicious_obs = None
             self.suspicious_act = None
+            
+        # init the fancy lineage detector
+        self.lineage_detector = NeuralLineageDetector(
+            self.original_model, self.suspicious_model,
+            self.original_cfg, self.suspicious_cfg,
+            self.device
+        )
         
         # Results storage
         self.results = {
@@ -1546,180 +2000,27 @@ class TransferLearningDetector:
         self.results['behavior_similarity']['verdict'] = verdict
         return self.results['behavior_similarity']
     
-    def compute_final_verdict(self) -> Dict:
-        """
-        Compute final verdict.
-        updated logic: if the fingerprints match, i don't care if the shoes don't fit.
-        """
-        Atomic.section("FINAL JUDGMENT", 11)
-        
-        score = 0
-        max_score = 0
-        evidence = []
-        smoking_gun = False
-        
-        # --- PHASE 1: THE "SMOKING GUN" CHECK ---
-        weight_sim = self.results.get('weight_similarity', {}).get('avg_cosine_similarity', 0)
-        cka_score = self.results.get('cka_similarity', {}).get('cka_score', 0)
-        
-        if weight_sim > 0.95:
-            smoking_gun = True
-            evidence.append(f"[!!!] SMOKING GUN: Weights are {weight_sim*100:.1f}% identical.")
-        
-        if cka_score > 0.98:
-            smoking_gun = True
-            evidence.append(f"[!!!] SMOKING GUN: Internal Representation (CKA) is {cka_score:.4f}.")
-
-        # --- PHASE 2: POINT SCORING ---
-        
-        # 1. Weight Similarity (10 points)
-        if 'verdict' in self.results['weight_similarity']:
-            max_score += 10
-            verdict = self.results['weight_similarity']['verdict']
-            if 'CRIT' in verdict: score += 10
-            elif 'WARN' in verdict: score += 6
-            elif 'SUS' in verdict: score += 3
-            if 'CRIT' in verdict or 'WARN' in verdict:
-                evidence.append(f"Weight Similarity: {verdict}")
-        
-        # 2. CKA Similarity (8 points)
-        if 'verdict' in self.results['cka_similarity']:
-            max_score += 8
-            verdict = self.results['cka_similarity']['verdict']
-            if 'HIGH' in verdict: score += 8
-            elif 'MED' in verdict: score += 5
-            elif 'LOW' in verdict: score += 2
-            if 'HIGH' in verdict or 'MED' in verdict:
-                evidence.append(f"CKA Similarity: {verdict}")
-
-        # 3. Distribution (5 points)
-        if 'verdict' in self.results['distribution_similarity']:
-            max_score += 5
-            verdict = self.results['distribution_similarity']['verdict']
-            if 'HIGH' in verdict: score += 5
-            elif 'MED' in verdict: score += 3
-            elif 'LOW' in verdict: score += 1
-            if 'HIGH' in verdict:
-                evidence.append(f"Distribution Similarity: {verdict}")
-
-        # 4. Activation (3 points)
-        if 'verdict' in self.results['activation_similarity']:
-            max_score += 3
-            verdict = self.results['activation_similarity']['verdict']
-            if 'HIGH' in verdict: score += 3
-            elif 'MED' in verdict: score += 1
-
-        # 5. Behavior & Gradients (2 points each)
-        for key, name in [('behavior_similarity', 'Behavior'), ('gradient_similarity', 'Gradient')]:
-            if 'verdict' in self.results[key]:
-                max_score += 2
-                verdict = self.results[key]['verdict']
-                if 'HIGH' in verdict: score += 2
-                elif 'MED' in verdict: score += 1
-        
-        # ==================== NEW ADVANCED METHODS SCORING ====================
-        # 6. Kickoff Analysis (4 points)
-        if 'kickoff_analysis' in self.results and 'verdict' in self.results['kickoff_analysis']:
-            max_score += 4
-            verdict = self.results['kickoff_analysis']['verdict']
-            if 'CRIT' in verdict: 
-                score += 4
-                evidence.append(f"Kickoff Behavior: {verdict}")
-            elif 'WARN' in verdict: 
-                score += 2
-                evidence.append(f"Kickoff Behavior: {verdict}")
-        
-        # 7. Transfer Learning Signature (5 points - CRITICAL)
-        if 'transfer_signature' in self.results and 'verdict' in self.results.get('transfer_signature', {}):
-            max_score += 5
-            verdict = self.results['transfer_signature'].get('verdict', '')
-            if 'CRIT' in verdict:
-                score += 5
-                evidence.append(f"TL Signature: {verdict}")
-        
-        # 8. Eigenvalue Spectrum (3 points)
-        if 'eigenvalue_spectrum' in self.results and 'verdict' in self.results['eigenvalue_spectrum']:
-            max_score += 3
-            verdict = self.results['eigenvalue_spectrum']['verdict']
-            if 'CRIT' in verdict:
-                score += 3
-                evidence.append(f"Eigenvalue Spectrum: {verdict}")
-            elif 'WARN' in verdict:
-                score += 2
-        
-        # 9. Decision Boundaries (3 points)
-        if 'decision_boundaries' in self.results and 'verdict' in self.results['decision_boundaries']:
-            max_score += 3
-            verdict = self.results['decision_boundaries']['verdict']
-            if 'CRIT' in verdict:
-                score += 3
-                evidence.append(f"Decision Boundaries: {verdict}")
-            elif 'WARN' in verdict:
-                score += 2
-        
-        # 10. Temporal Consistency (2 points)
-        if 'temporal_consistency' in self.results and 'verdict' in self.results['temporal_consistency']:
-            max_score += 2
-            verdict = self.results['temporal_consistency']['verdict']
-            if 'CRIT' in verdict:
-                score += 2
-                evidence.append(f"Temporal Behavior: {verdict}")
-            elif 'WARN' in verdict:
-                score += 1
-        # ==================== END NEW METHODS SCORING ====================
-        
-        # --- PHASE 3: CALCULATE CONFIDENCE ---
-        
-        if smoking_gun:
-            confidence = 99.9
-            final_verdict = "CONFIRMED COPY / TRANSFER LEARNING"
-            color = Atomic.RED
-        else:
-            confidence = (score / max_score * 100) if max_score > 0 else 0
+    def run_neural_lineage_analysis(self) -> Dict:
+        """wraps the ntk stuff."""
+        results = {}
+        try:
+            results['lineage_l2'] = self.lineage_detector.compute_similarity_with_linearization(metric='l2')
+        except Exception as e: Atomic.log(f"lineage l2 broke: {e}", "WARN")
             
-            if confidence >= 85:
-                final_verdict = "HIGHLY LIKELY TRANSFER LEARNING"
-                color = Atomic.RED
-            elif confidence >= 65:
-                final_verdict = "LIKELY TRANSFER LEARNING"
-                color = Atomic.YELLOW
-            elif confidence >= 40:
-                final_verdict = "POSSIBLE TRANSFER LEARNING"
-                color = Atomic.YELLOW
-            elif confidence >= 20:
-                final_verdict = "UNLIKELY"
-                color = Atomic.GREEN
-            else:
-                final_verdict = "NO EVIDENCE"
-                color = Atomic.GREEN
-        
-        self.results['final_verdict'] = {
-            'verdict': final_verdict,
-            'confidence_percentage': float(confidence),
-            'score': score,
-            'max_score': max_score,
-            'evidence': evidence,
-            'is_smoking_gun': smoking_gun
-        }
-        
-        print(f"\n{Atomic.PURPLE}========================================================{Atomic.RESET}")
-        print(f"  STATUS:     {color}{Atomic.BOLD}{final_verdict}{Atomic.RESET}")
-        print(f"  CONFIDENCE: {color}{confidence:.1f}%{Atomic.RESET}")
-        print(f"{Atomic.PURPLE}========================================================{Atomic.RESET}")
+        try:
+            results['layer_lineage'] = self.lineage_detector.analyze_layer_wise_lineage()
+        except Exception as e: Atomic.log(f"layer lineage broke: {e}", "WARN")
             
-        print(f"\n{Atomic.GREY}EVIDENCE LOCKER:{Atomic.RESET}")
-        for e in evidence:
-            print(f"  - {e}")
-        if not evidence:
-            print("  - No significant evidence detected")
-        print("")
-        
-        return self.results['final_verdict']
-    
+        try:
+            results['finetuning_pattern'] = self.lineage_detector.detect_fine_tuning_pattern()
+        except Exception as e: Atomic.log(f"finetuning pattern broke: {e}", "WARN")
+            
+        try:
+            results['ntk_similarity'] = self.lineage_detector.compute_ntk_similarity()
+        except Exception as e: Atomic.log(f"ntk sim broke: {e}", "WARN")
+            
+        return results
 
-    # ==================== ADVANCED DETECTION METHODS ====================
-    # Added by integrate_advanced_methods.py
-    
     def analyze_kickoff_behavior(self, num_kickoffs: int = 100) -> Dict:
         """
         [NEW METHOD 1/8] Analyze behavior specifically on kickoff states
@@ -2139,7 +2440,199 @@ class TransferLearningDetector:
         self.results['temporal_consistency']['verdict'] = verdict
         return self.results['temporal_consistency']
     
-    # ==================== END ADVANCED METHODS ====================
+    def compute_final_verdict(self) -> Dict:
+        """
+        Compute final verdict.
+        updated logic: if the fingerprints match, i don't care if the shoes don't fit.
+        """
+        Atomic.section("FINAL JUDGMENT", 12)
+        
+        score = 0
+        max_score = 0
+        evidence = []
+        smoking_gun = False
+        
+        # --- PHASE 1: THE "SMOKING GUN" CHECK ---
+        weight_sim = self.results.get('weight_similarity', {}).get('avg_cosine_similarity', 0)
+        cka_score = self.results.get('cka_similarity', {}).get('cka_score', 0)
+        
+        if weight_sim > 0.95:
+            smoking_gun = True
+            evidence.append(f"[!!!] SMOKING GUN: Weights are {weight_sim*100:.1f}% identical.")
+        
+        if cka_score > 0.98:
+            smoking_gun = True
+            evidence.append(f"[!!!] SMOKING GUN: Internal Representation (CKA) is {cka_score:.4f}.")
+
+        # --- PHASE 2: POINT SCORING ---
+        
+        # 1. Weight Similarity (10 points)
+        if 'verdict' in self.results['weight_similarity']:
+            max_score += 10
+            verdict = self.results['weight_similarity']['verdict']
+            if 'CRIT' in verdict: score += 10
+            elif 'WARN' in verdict: score += 6
+            elif 'SUS' in verdict: score += 3
+            if 'CRIT' in verdict or 'WARN' in verdict:
+                evidence.append(f"Weight Similarity: {verdict}")
+        
+        # 2. CKA Similarity (8 points)
+        if 'verdict' in self.results['cka_similarity']:
+            max_score += 8
+            verdict = self.results['cka_similarity']['verdict']
+            if 'HIGH' in verdict: score += 8
+            elif 'MED' in verdict: score += 5
+            elif 'LOW' in verdict: score += 2
+            if 'HIGH' in verdict or 'MED' in verdict:
+                evidence.append(f"CKA Similarity: {verdict}")
+
+        # 3. Distribution (5 points)
+        if 'verdict' in self.results['distribution_similarity']:
+            max_score += 5
+            verdict = self.results['distribution_similarity']['verdict']
+            if 'HIGH' in verdict: score += 5
+            elif 'MED' in verdict: score += 3
+            elif 'LOW' in verdict: score += 1
+            if 'HIGH' in verdict:
+                evidence.append(f"Distribution Similarity: {verdict}")
+
+        # 4. Activation (3 points)
+        if 'verdict' in self.results['activation_similarity']:
+            max_score += 3
+            verdict = self.results['activation_similarity']['verdict']
+            if 'HIGH' in verdict: score += 3
+            elif 'MED' in verdict: score += 1
+
+        # 5. Behavior & Gradients (2 points each)
+        for key, name in [('behavior_similarity', 'Behavior'), ('gradient_similarity', 'Gradient')]:
+            if 'verdict' in self.results[key]:
+                max_score += 2
+                verdict = self.results[key]['verdict']
+                if 'HIGH' in verdict: score += 2
+                elif 'MED' in verdict: score += 1
+        
+        # ==================== NEW ADVANCED METHODS SCORING ====================
+        # 6. Kickoff Analysis (4 points)
+        if 'kickoff_analysis' in self.results and 'verdict' in self.results['kickoff_analysis']:
+            max_score += 4
+            verdict = self.results['kickoff_analysis']['verdict']
+            if 'CRIT' in verdict: 
+                score += 4
+                evidence.append(f"Kickoff Behavior: {verdict}")
+            elif 'WARN' in verdict: 
+                score += 2
+                evidence.append(f"Kickoff Behavior: {verdict}")
+        
+        # 7. Transfer Learning Signature (5 points - CRITICAL)
+        if 'transfer_signature' in self.results and 'verdict' in self.results.get('transfer_signature', {}):
+            max_score += 5
+            verdict = self.results['transfer_signature'].get('verdict', '')
+            if 'CRIT' in verdict:
+                score += 5
+                evidence.append(f"TL Signature: {verdict}")
+        
+        # 8. Eigenvalue Spectrum (3 points)
+        if 'eigenvalue_spectrum' in self.results and 'verdict' in self.results['eigenvalue_spectrum']:
+            max_score += 3
+            verdict = self.results['eigenvalue_spectrum']['verdict']
+            if 'CRIT' in verdict:
+                score += 3
+                evidence.append(f"Eigenvalue Spectrum: {verdict}")
+            elif 'WARN' in verdict:
+                score += 2
+        
+        # 9. Decision Boundaries (3 points)
+        if 'decision_boundaries' in self.results and 'verdict' in self.results['decision_boundaries']:
+            max_score += 3
+            verdict = self.results['decision_boundaries']['verdict']
+            if 'CRIT' in verdict:
+                score += 3
+                evidence.append(f"Decision Boundaries: {verdict}")
+            elif 'WARN' in verdict:
+                score += 2
+        
+        # 10. Temporal Consistency (2 points)
+        if 'temporal_consistency' in self.results and 'verdict' in self.results['temporal_consistency']:
+            max_score += 2
+            verdict = self.results['temporal_consistency']['verdict']
+            if 'CRIT' in verdict:
+                score += 2
+                evidence.append(f"Temporal Behavior: {verdict}")
+            elif 'WARN' in verdict:
+                score += 1
+        
+        # 11. Neural Lineage (New stuff)
+        if 'lineage_l2' in self.results and 'verdict' in self.results['lineage_l2']:
+            max_score += 12
+            v = self.results['lineage_l2']['verdict']
+            if 'CRIT' in v:
+                score += 12; evidence.append(f"[NTK] Lineage L2: {v}"); smoking_gun = True
+            elif 'WARN' in v: score += 6
+            
+        if 'layer_lineage' in self.results and 'verdict' in self.results['layer_lineage']:
+            max_score += 10
+            v = self.results['layer_lineage']['verdict']
+            if 'CRIT' in v:
+                score += 10; evidence.append(f"[NTK] Layer Lineage: {v}"); smoking_gun = True
+            elif 'WARN' in v: score += 5
+        
+        if 'finetuning_pattern' in self.results and 'verdict' in self.results['finetuning_pattern']:
+            max_score += 8
+            v = self.results['finetuning_pattern']['verdict']
+            pat = self.results['finetuning_pattern'].get('detected_pattern', '')
+            if 'CRIT' in v or 'CLASSIC' in pat:
+                score += 8; evidence.append(f"[NTK] Pattern: {pat}"); smoking_gun = True
+            elif 'WARN' in v: score += 4
+            
+        # ==================== END NEW METHODS SCORING ====================
+        
+        # --- PHASE 3: CALCULATE CONFIDENCE ---
+        
+        if smoking_gun:
+            confidence = 99.9
+            final_verdict = "CONFIRMED COPY / TRANSFER LEARNING"
+            color = Atomic.RED
+        else:
+            confidence = (score / max_score * 100) if max_score > 0 else 0
+            
+            if confidence >= 85:
+                final_verdict = "HIGHLY LIKELY TRANSFER LEARNING"
+                color = Atomic.RED
+            elif confidence >= 65:
+                final_verdict = "LIKELY TRANSFER LEARNING"
+                color = Atomic.YELLOW
+            elif confidence >= 40:
+                final_verdict = "POSSIBLE TRANSFER LEARNING"
+                color = Atomic.YELLOW
+            elif confidence >= 20:
+                final_verdict = "UNLIKELY"
+                color = Atomic.GREEN
+            else:
+                final_verdict = "NO EVIDENCE"
+                color = Atomic.GREEN
+        
+        self.results['final_verdict'] = {
+            'verdict': final_verdict,
+            'confidence_percentage': float(confidence),
+            'score': score,
+            'max_score': max_score,
+            'evidence': evidence,
+            'is_smoking_gun': smoking_gun
+        }
+        
+        print(f"\n{Atomic.PURPLE}========================================================{Atomic.RESET}")
+        print(f"  STATUS:     {color}{Atomic.BOLD}{final_verdict}{Atomic.RESET}")
+        print(f"  CONFIDENCE: {color}{confidence:.1f}%{Atomic.RESET}")
+        print(f"{Atomic.PURPLE}========================================================{Atomic.RESET}")
+            
+        print(f"\n{Atomic.GREY}EVIDENCE LOCKER:{Atomic.RESET}")
+        for e in evidence:
+            print(f"  - {e}")
+        if not evidence:
+            print("  - No significant evidence detected")
+        print("")
+        
+        return self.results['final_verdict']
     
     def run_full_analysis(self) -> Dict:
         """Run complete analysis"""
@@ -2203,6 +2696,13 @@ class TransferLearningDetector:
         except Exception as e:
             Atomic.log(f"Temporal consistency analysis failed: {e}", "CRIT")
         # ==================== END NEW METHODS ====================
+        
+        print(f"\n{Atomic.PURPLE}{'='*60}{Atomic.RESET}")
+        print(f"{Atomic.BOLD}{Atomic.CYAN}  NEURAL LINEAGE DETECTION (CVPR 2024){Atomic.RESET}")
+        print(f"{Atomic.PURPLE}{'='*60}{Atomic.RESET}\n")
+        
+        lineage_res = self.run_neural_lineage_analysis()
+        self.results.update(lineage_res)
         
         self.compute_final_verdict()
         
